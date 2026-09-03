@@ -36,7 +36,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 
@@ -129,6 +129,49 @@ def _extract_json_blob(raw: str) -> Optional[dict]:
     return val
 
 
+def _diagnose_empty(resp: Any) -> str:
+    """Build a diagnostic reason string for an empty/blank LLM response.
+
+    Issue #81: the failure path previously recorded no cause, so an empty
+    response was indistinguishable from a silent provider outage. Surface
+    everything the response object still carries after content came back
+    blank: model, finish_reason, reasoning_content presence (reasoning
+    models can emit all text there and leave ``content`` empty), and token
+    usage. Best-effort — never raises.
+    """
+    parts: list[str] = []
+    try:
+        model = getattr(resp, "model", None)
+        if model:
+            parts.append(f"model={model}")
+        choice = resp.choices[0]
+        finish = getattr(choice, "finish_reason", None)
+        if finish:
+            parts.append(f"finish_reason={finish}")
+        msg = choice.message
+        reasoning = getattr(msg, "reasoning_content", None) or getattr(
+            msg, "reasoning", None
+        )
+        if isinstance(reasoning, str) and reasoning.strip():
+            parts.append(
+                f"reasoning_content present ({len(reasoning)} chars) — "
+                "model may have emitted all text as reasoning with empty content"
+            )
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            ct = getattr(usage, "completion_tokens", None)
+            pt = getattr(usage, "prompt_tokens", None)
+            if ct is not None:
+                parts.append(f"completion_tokens={ct}")
+            if pt is not None:
+                parts.append(f"prompt_tokens={pt}")
+            if ct == 0:
+                parts.append("provider returned zero completion tokens")
+    except Exception as exc:  # pragma: no cover — best-effort only
+        parts.append(f"diagnostics unavailable ({type(exc).__name__})")
+    return "; ".join(parts) if parts else "no diagnostic fields on response"
+
+
 def _profile_author() -> str:
     """Mirror of ``hermes_cli.kanban._profile_author``. Kept local to
     avoid a circular import when kanban.py imports this module."""
@@ -211,8 +254,12 @@ def specify_task(
         # the task in triage on a malformed LLM reply.
         stripped_raw = raw.strip()
         if not stripped_raw:
+            cause = _diagnose_empty(resp)
+            logger.info(
+                "specify: empty response for %s — %s", task_id, cause
+            )
             return SpecifyOutcome(
-                task_id, False, "LLM returned an empty response"
+                task_id, False, f"LLM returned an empty response ({cause})"
             )
         new_title = None
         new_body = stripped_raw
