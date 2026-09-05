@@ -74,6 +74,21 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_no_nudge_for_delegated_child(clear_kanban_env):
+    """delegate_task children inherit HERMES_KANBAN_TASK (in-process threads)
+    but cannot call kanban tools — the guard must not fire for them."""
+    from agent.delegation_context import delegated_child_context
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    # Parent worker scope: guard on.
+    assert kanban_stop_nudge_enabled() is True
+    with delegated_child_context("child-session"):
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[], attempts=0) is None
+    # Guard restored for the parent worker after the child scope exits.
+    assert kanban_stop_nudge_enabled() is True
+
+
 
 
 

@@ -13,9 +13,11 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Iterable, Optional
 
+logger = logging.getLogger(__name__)
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
@@ -27,12 +29,29 @@ def kanban_stop_nudge_enabled() -> bool:
 
     On when ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), unless
     ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it.
+
+    delegate_task children run in-process inside the worker and inherit
+    ``HERMES_KANBAN_TASK``, but they cannot call kanban tools (the kanban
+    toolset is force-blocked for children in ``_build_child_agent``), so the
+    guard misfires on every clean child exit ("tried to exit without
+    kanban_complete" nudges with no possible compliance). Suppress the guard
+    for children via ``is_delegated_child_context()`` — a ContextVar, so
+    concurrent children and the parent worker are unaffected.
     """
     env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    return bool(task)
+    if not task:
+        return False
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        if is_delegated_child_context():
+            return False
+    except Exception:
+        logger.debug("delegated-child context check failed", exc_info=True)
+    return True
 
 
 def _tool_call_name(tc: Any) -> str:
