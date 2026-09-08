@@ -4666,6 +4666,42 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        # G3 — claim guard: reject a claim when the task is assigned to 'reviewer'
+        # AND the latest transition event is review_requested with no intervening
+        # changes_requested. This prevents the implementer from reclaiming
+        # during a pending review. Positive control: implementer reclaim after
+        # changes_requested (post-rework) succeeds.
+        trow_for_guard = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if trow_for_guard and trow_for_guard["assignee"]:
+            assignee = trow_for_guard["assignee"].strip().lower()
+            if assignee == "reviewer":
+                # Task is with reviewer — find the latest review_requested event
+                # specifically (ignoring audit events like claim_rejected).
+                latest_review_requested = conn.execute(
+                    "SELECT id, kind FROM task_events "
+                    "WHERE task_id = ? AND kind = 'review_requested' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if latest_review_requested:
+                    # Found a review_requested — check for changes_requested after it.
+                    intervening_changes = conn.execute(
+                        "SELECT id FROM task_events "
+                        "WHERE task_id = ? AND kind = 'changes_requested' "
+                        "AND id > ? ORDER BY id DESC LIMIT 1",
+                        (task_id, int(latest_review_requested["id"])),
+                    ).fetchone()
+                    if intervening_changes is None:
+                        # No changes_requested after the review_requested —
+                        # this is a pending review claim attempt. Reject it.
+                        _append_event(
+                            conn, task_id, "claim_rejected",
+                            {"reason": "review_pending"},
+                        )
+                        return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -5408,6 +5444,52 @@ def complete_task(
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+
+    # G1 — self-approval guard: reject completion when the latest CLOSED run
+    # has outcome 'changes_requested' AND the completing caller is that
+    # implementer (the same profile that received the changes_requested).
+    # Positive control: completion with NO changes_requested in recent history
+    # is unaffected.
+    latest_closed = conn.execute(
+        "SELECT id, profile, outcome FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY started_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest_closed is not None and latest_closed["outcome"] == "changes_requested":
+        # Find the implementer who received the changes_requested.
+        changes_event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'changes_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(latest_closed["id"])),
+        ).fetchone()
+        implementer = None
+        if changes_event and changes_event["payload"]:
+            try:
+                payload = json.loads(changes_event["payload"])
+                implementer = payload.get("implementer")
+            except (json.JSONDecodeError, TypeError):
+                pass
+        # Get the current caller's identity from the current run's profile.
+        # This is the actual profile running the task (e.g., 'coder', 'reviewer'),
+        # NOT the host:pid from claim_lock.
+        current_run = latest_run(conn, task_id)
+        if current_run and current_run.profile:
+            caller = current_run.profile.strip().lower()
+            if caller and implementer and caller == implementer.lower():
+                # Self-approval attempt detected — block it.
+                _append_event(
+                    conn, task_id, "completion_blocked_self_approval",
+                    {
+                        "implementer": implementer,
+                        "reviewer": latest_closed["profile"],
+                        "run_id": latest_closed["id"],
+                        "caller": caller,
+                    },
+                )
+                # Fail safe: return False but don't mutate task state.
+                return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -6596,6 +6678,12 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
                 reviewer = prior_reviewer
+        # G2 — default reviewer: when the reviewer argument is omitted (both
+        # on first review and re-review without a prior), default to profile
+        # 'reviewer' instead of leaving assignee unchanged.
+        # Positive control: explicit --reviewer still wins.
+        if reviewer is None:
+            reviewer = "reviewer"
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
