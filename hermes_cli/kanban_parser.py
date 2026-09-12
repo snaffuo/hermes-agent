@@ -283,6 +283,10 @@ _SPECS = [
         _arg("--metadata",
              help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                   '"tests_run": 12}\'). Stored on the closing run.'),
+        _arg("--hashes-confirmed", action="store_true",
+             help="Confirm that every attachment's sha256 is listed in the completion summary or "
+                  "result. Required when the task has stored attachments and neither completion "
+                  "field contains any sha256-looking hash (evidence hash rule)."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,

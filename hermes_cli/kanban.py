@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -853,6 +854,28 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
     return None
 
 
+_SHA256_RE = re.compile(r"\b[0-9a-f]{64}\b", re.IGNORECASE)
+
+
+def _hash_evidence_error(conn, tid: str, summary: Optional[str], result: Optional[str],
+                         hashes_confirmed: bool) -> Optional[str]:
+    """Evidence hash rule (Mark 2026-09-12): a completing run must leave every stored
+    attachment's sha256 greppable in its summary or result. Refuse the completion when the
+    card has attachments, neither field carries any 64-hex hash, and the caller has not
+    explicitly confirmed with --hashes-confirmed."""
+    if hashes_confirmed:
+        return None
+    if not kb.list_attachments(conn, tid):
+        return None
+    text = f"{summary or ''}\n{result or ''}"
+    if _SHA256_RE.search(text):
+        return None
+    return ("completion refused: the card has stored attachments but neither the summary nor "
+            "the result lists any sha256 hash. List every attachment's sha256 (computed from "
+            "the stored copies), or pass --hashes-confirmed to confirm hashes are recorded "
+            "elsewhere / there is nothing to hash.")
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids, rc = _require_ids(args)
@@ -860,6 +883,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return rc
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    hashes_confirmed = bool(getattr(args, "hashes_confirmed", False))
     # Handoff fields are per-run; refuse to copy them across N runs.
     if len(ids) > 1 and (summary or raw_meta):
         return _err("kanban: --summary / --metadata are per-task and can't be used "
@@ -877,6 +901,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 "Provide evidence matching the task's acceptance criteria.")
             if gate_err:
                 fail_msg[tid] = gate_err
+                return False
+            hash_err = _hash_evidence_error(conn, tid, summary, args.result, hashes_confirmed)
+            if hash_err:
+                fail_msg[tid] = hash_err
                 return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
             return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
