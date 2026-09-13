@@ -927,10 +927,13 @@ class TestE2EPermissions:
         assert result["approvals"][0]["id"] == "a1"
 
     def test_respond_allow(self, mcp_server_e2e, _event_loop):
+        # Handler-level (not wire): the tool is deliberately unregistered
+        # (see TestToolRegistration::test_permissions_respond_not_registered);
+        # call _ToolHandlers.permissions_respond directly so its logic stays covered.
         server, bridge = mcp_server_e2e
+        handlers = server._handlers
         bridge._pending_approvals["a1"] = {"id": "a1", "kind": "exec"}
-        result = _run_tool(server, "permissions_respond",
-                          {"id": "a1", "decision": "allow-once"})
+        result = json.loads(handlers.permissions_respond(id="a1", decision="allow-once"))
         assert result["resolved"] is True
         assert result["decision"] == "allow-once"
         # Should be gone now
@@ -940,21 +943,18 @@ class TestE2EPermissions:
     def test_respond_deny(self, mcp_server_e2e, _event_loop):
         server, bridge = mcp_server_e2e
         bridge._pending_approvals["a2"] = {"id": "a2", "kind": "plugin"}
-        result = _run_tool(server, "permissions_respond",
-                          {"id": "a2", "decision": "deny"})
+        result = json.loads(server._handlers.permissions_respond(id="a2", decision="deny"))
         assert result["resolved"] is True
 
     def test_respond_invalid_decision(self, mcp_server_e2e, _event_loop):
         server, bridge = mcp_server_e2e
         bridge._pending_approvals["a3"] = {"id": "a3", "kind": "exec"}
-        result = _run_tool(server, "permissions_respond",
-                          {"id": "a3", "decision": "maybe"})
+        result = json.loads(server._handlers.permissions_respond(id="a3", decision="maybe"))
         assert "error" in result
 
     def test_respond_nonexistent(self, mcp_server_e2e, _event_loop):
         server, _ = mcp_server_e2e
-        result = _run_tool(server, "permissions_respond",
-                          {"id": "nope", "decision": "deny"})
+        result = json.loads(server._handlers.permissions_respond(id="nope", decision="deny"))
         assert "error" in result
 
 
@@ -972,9 +972,27 @@ class TestToolRegistration:
             "conversations_list", "conversation_get", "messages_read",
             "attachments_fetch", "events_poll", "events_wait",
             "messages_send", "channels_list",
-            "permissions_list_open", "permissions_respond",
+            "permissions_list_open",
         }
         assert expected == tool_names, f"Missing: {expected - tool_names}, Extra: {tool_names - expected}"
+
+    def test_permissions_respond_not_registered(self, mcp_server_e2e, _event_loop):
+        # Guard the removal: permissions_respond must not be reachable over the
+        # wire. Its exposure let a bridge client answer Hermes's approval
+        # prompts, routing around the human-approval rule for destructive
+        # actions. The handler method stays (behaviour still covered); only
+        # registration is removed.
+        server, _ = mcp_server_e2e
+        tool_names = {t.name for t in server._tool_manager.list_tools()}
+        assert "permissions_respond" not in tool_names
+        try:
+            asyncio.get_event_loop().run_until_complete(
+                server.call_tool("permissions_respond", {"id": "x", "decision": "deny"})
+            )
+            raised = False
+        except Exception:
+            raised = True
+        assert raised, "permissions_respond must be unreachable over the wire"
 
     def test_tools_have_descriptions(self, mcp_server_e2e, _event_loop):
         server, _ = mcp_server_e2e

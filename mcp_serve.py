@@ -713,7 +713,7 @@ _PREVIEW_CHAR_LIMIT = 2000
 _TOOL_NAMES = (
     "conversations_list", "conversation_get", "messages_read", "attachments_fetch",
     "events_poll", "events_wait", "messages_send", "channels_list",
-    "permissions_list_open", "permissions_respond",
+    "permissions_list_open",
 )
 
 
@@ -729,7 +729,9 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "MCPServer"
     handlers = _ToolHandlers(event_bridge or EventBridge())
     for name in _TOOL_NAMES:
         mcp.tool()(getattr(handlers, name))
-    return mcp
+    server = mcp
+    server._handlers = handlers  # test access to unregistered handlers (e.g. permissions_respond)
+    return server
 
 
 def run_mcp_server(verbose: bool = False) -> None:
