@@ -178,6 +178,31 @@ def _load_sessions_index_from_json() -> dict:
     return {k: v for k, v in data.items() if not str(k).startswith("_")} if isinstance(data, dict) else {}
 
 
+def _query_gateway_verb(verb: str, params: dict, *, timeout: float = 10.0):
+    """Send one parameterized control verb to the gateway serving HERMES_HOME over
+    ``gateway.sock``. Returns ``(response_dict, None)`` on a well-formed answer,
+    ``(None, error_str)`` when nothing answers or the answer is malformed (the
+    client helper in gateway/control_socket.py swallows failures to None, so
+    errors are re-surfaced here rather than returned as None)."""
+    from gateway.control_socket import CONTROL_PROTOCOL_VERSION, _query_unix_socket
+    request = json.dumps({"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION,
+                          "params": params}).encode("utf-8") + b"\n"
+    try:
+        raw = _query_unix_socket(_hermes_home(), request, timeout)
+    except Exception as e:
+        return None, f"Gateway control socket query failed: {e}"
+    if raw is None:
+        return None, (f"No gateway control socket is answering on this machine — is the gateway "
+                      f"running and up to date? (gateway.sock, verb '{verb}')")
+    try:
+        response = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None, "Gateway control socket returned a malformed answer"
+    if not isinstance(response, dict):
+        return None, "Gateway control socket returned an unexpected answer"
+    return response, None
+
+
 def _load_channel_directory() -> dict:
     """Load the cached channel directory for available targets."""
     return _read_json(_hermes_home() / "channel_directory.json")
@@ -646,6 +671,50 @@ class _ToolHandlers:
         except Exception as e:
             return json.dumps({"error": f"Send failed: {e}"})
 
+    def turns_inject(self, session_key: str, text: str) -> str:
+        """Inject a message as a user turn into an existing conversation.
+
+        The message enters through the gateway's normal inbound path: it appears
+        in the session as a user-role turn (prefixed with "[CLAUDE] " for
+        attribution) and Hermes answers it in that same conversation, exactly as
+        if the user had typed it. The conversation must already exist — use
+        conversations_list or events_poll for its session_key. Unknown keys and
+        texts over 20000 characters are refused, never truncated or created.
+
+        Args:
+            session_key: The session key from conversations_list (exact)
+            text: The message text to inject as a user turn
+        """
+        if not session_key or not str(session_key).strip():
+            return json.dumps({"error": "session_key is required"})
+        if not text or not str(text).strip():
+            return json.dumps({"error": "text is required"})
+        # The gateway control socket drops requests over its 64KB byte cap WITHOUT
+        # answering, which would surface as a misleading "socket not running". Check
+        # the encoded size here so multibyte text that fits the 20000-char cap but
+        # not the wire gets an honest refusal (never truncation).
+        try:
+            from gateway.control_socket import _MAX_REQUEST_BYTES
+            if len(str(text).encode("utf-8")) + 256 > _MAX_REQUEST_BYTES:
+                return json.dumps({"error": f"text too large for the control wire: "
+                                            f"{len(str(text).encode('utf-8'))} bytes exceeds cap of "
+                                            f"{_MAX_REQUEST_BYTES}"})
+        except ImportError:
+            pass
+        response, error = _query_gateway_verb("inject-turn",
+                                              {"session_key": str(session_key), "text": str(text)})
+        if error or not isinstance(response, dict):
+            return json.dumps({"error": error or "Gateway returned an unexpected answer"})
+        if response.get("ok") is not True:
+            return json.dumps({"error": response.get("error") or "Gateway rejected the request"})
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return json.dumps({"error": "Gateway returned an unexpected result"})
+        if result.get("ok") is not True:
+            return json.dumps({"error": result.get("error") or "Gateway refused the injection"})
+        return json.dumps({"injected": True, "session_key": result.get("session_key", session_key),
+                           "pending": bool(result.get("pending", False))}, indent=2)
+
     def channels_list(self, platform: Optional[str] = None) -> str:
         """List available messaging channels and targets across platforms.
 
@@ -712,7 +781,7 @@ _PREVIEW_CHAR_LIMIT = 2000
 # Registration order == list_tools order (wire format).
 _TOOL_NAMES = (
     "conversations_list", "conversation_get", "messages_read", "attachments_fetch",
-    "events_poll", "events_wait", "messages_send", "channels_list",
+    "events_poll", "events_wait", "messages_send", "turns_inject", "channels_list",
     "permissions_list_open",
 )
 
