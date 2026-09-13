@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -118,13 +119,39 @@ def build_status_payload() -> dict[str, Any]:
             "answered_at": time.time(), "answering_pid": os.getpid()}
 
 
+_PARAM_ARITY: dict[Callable[..., Any], bool] = {}
+
+
+def _handler_wants_params(handler: Callable[..., Any]) -> bool:
+    """True when a verb handler takes one positional argument (the request's ``params`` dict).
+    Result cached per handler; a non-introspectable callable defaults to zero-arg (legacy)."""
+    try:
+        cached = _PARAM_ARITY.get(handler)
+    except TypeError:  # unhashable callable — compute, don't cache
+        cached = None
+    if cached is None:
+        try:
+            sig = inspect.signature(handler)
+            cached = any(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                         and p.default is p.empty for p in sig.parameters.values())
+        except (TypeError, ValueError):
+            cached = False
+        with contextlib.suppress(Exception):
+            _PARAM_ARITY[handler] = cached
+    return cached
+
+
 class GatewayControlServer:
     """Gateway-owned control socket server (identify/status, v1): ``start()`` after the PID-file claim,
     ``stop()`` on shutdown. All failures are non-fatal — the gateway never refuses to serve messaging
-    because its control socket couldn't bind; consumers fall back to the scan layer."""
+    because its control socket couldn't bind; consumers fall back to the scan layer.
+
+    Verb handlers are zero-arg callables OR one-arg callables: the latter receive the request's
+    ``params`` dict (``{}`` when the client sent none) — see :meth:`handle_request_line`.
+    """
 
     def __init__(self, home: Optional[Path] = None, *,
-                 verb_handlers: Optional[dict[str, Callable[[], dict[str, Any]]]] = None) -> None:
+                 verb_handlers: Optional[dict[str, Callable[..., dict[str, Any]]]] = None) -> None:
         if home is None:
             from gateway.status import _get_process_hermes_home
             home = _get_process_hermes_home()
@@ -133,7 +160,7 @@ class GatewayControlServer:
         self._pipe_server: Any = None  # Windows proactor pipe server
         self._bind_path: Optional[Path] = None
         self._pointer_file: Optional[Path] = None
-        self._handlers: dict[str, Callable[[], dict[str, Any]]] = {
+        self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
 
     async def start(self) -> bool:
@@ -209,6 +236,15 @@ class GatewayControlServer:
             if handler is None:
                 response: dict[str, Any] = {"ok": False, "error": f"unknown verb: {verb!r}",
                                             "protocol": CONTROL_PROTOCOL_VERSION, "supported_verbs": sorted(self._handlers)}
+            elif _handler_wants_params(handler):
+                params = request.get("params")
+                if params is None:
+                    params = {}
+                if not isinstance(params, dict):
+                    response = {"ok": False, "error": "params must be a JSON object",
+                                "protocol": CONTROL_PROTOCOL_VERSION}
+                else:
+                    response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION, "result": handler(params)}
             else:
                 response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION, "result": handler()}
         except Exception as exc:
