@@ -519,17 +519,28 @@ class _ToolHandlers:
             "total_tokens": entry.get("total_tokens", 0),
         }, indent=2)
 
-    def messages_read(self, session_key: str, limit: int = 50) -> str:
+    def messages_read(self, session_key: str, limit: int = 50, offset: int = 0,
+                      full: bool = False) -> str:
         """Read recent messages from a conversation.
 
         Returns the message history in chronological order with role, content,
         and timestamp for each message.
 
+        Content is truncated at 2000 characters per message unless ``full`` is
+        set; every truncated message reports ``"truncated": true`` and
+        ``"stored_length"`` so the cut is never silent.
+
         Args:
             session_key: The session key from conversations_list
             limit: Maximum number of messages to return (default 50, most recent)
+            offset: Skip this many most-recent messages before applying limit
+                (paging: offset 0 + limit 20 = the 20 most recent; offset 20 +
+                limit 20 = the 20 before them). 0 = default.
+            full: Return complete message content instead of the 2000-character
+                per-message preview. Use when a message was reported truncated.
         """
         limit = _coerce_int(limit, default=50, minimum=1, maximum=200)
+        offset = _coerce_int(offset, default=0, minimum=0, maximum=10**9)
         all_messages, error = _conversation_messages(session_key)
         if error:
             return error
@@ -538,10 +549,22 @@ class _ToolHandlers:
             role = msg.get("role", "")
             content = _extract_message_content(msg) if role in {"user", "assistant"} else ""
             if content:
-                filtered.append({"id": str(msg.get("id", "")), "role": role,
-                                 "content": content[:2000], "timestamp": msg.get("timestamp", "")})
-        messages = filtered[-limit:]
+                entry = {"id": str(msg.get("id", "")), "role": role, "timestamp": msg.get("timestamp", "")}
+                entry["stored_length"] = len(content)
+                if full or len(content) <= _PREVIEW_CHAR_LIMIT:
+                    entry["content"] = content
+                    entry["truncated"] = False
+                else:
+                    entry["content"] = content[:_PREVIEW_CHAR_LIMIT]
+                    entry["truncated"] = True
+                filtered.append(entry)
+        # Page over the filtered (newest-last) list from the most recent end,
+        # matching the previous `filtered[-limit:]` behaviour at offset 0.
+        end = len(filtered) - offset
+        start = max(0, end - limit)
+        messages = filtered[max(0, start):max(0, end)]
         return json.dumps({"session_key": session_key, "count": len(messages),
+                           "offset": offset, "full": bool(full),
                            "total_in_session": len(filtered), "messages": messages}, indent=2)
 
     def attachments_fetch(self, session_key: str, message_id: str) -> str:
@@ -680,6 +703,11 @@ class _ToolHandlers:
             return json.dumps({"error": f"Invalid decision: {decision}. Must be allow-once, allow-always, or deny"})
         return json.dumps(self.bridge.respond_to_approval(id, decision), indent=2)
 
+
+# Per-message content cap for messages_read previews. Every truncated message
+# carries "truncated": true + "stored_length" so a cut is never silent; use
+# full=true to read past the preview.
+_PREVIEW_CHAR_LIMIT = 2000
 
 # Registration order == list_tools order (wire format).
 _TOOL_NAMES = (
