@@ -5019,6 +5019,11 @@ INJECT_TURN_PREFIX = "[CLAUDE] "
 # _inject_turn's TimeoutError branch.
 _INJECT_TURN_TIMEOUT_SECONDS = 5.0
 
+# Bounded wait for the mirror post — a hung mirror must not block admission,
+# so this is a hard timeout that forces the fire-and-forget task to give up.
+# The mirror is an observation, not a precondition (ISOLATION).
+_MIRROR_INJECT_TIMEOUT_SECONDS = 3.0
+
 
 def _log_inject_turn_late_failure(session_key: str):
     """Done-callback for a pending ``inject-turn`` future: if the coroutine later
@@ -5038,15 +5043,87 @@ def _log_inject_turn_late_failure(session_key: str):
     return _done
 
 
+def _log_mirror_inject_failure(session_key: str, fut):
+    """Done-callback for the fire-and-forget mirror task: logs any exception
+    from the mirror post WITHOUT propagating it. A hung/failed mirror is an
+    observation, never a precondition (ISOLATION)."""
+    if fut.cancelled():
+        logger.debug("inject-turn mirror for %s was cancelled", session_key)
+        return
+    exc = fut.exception()
+    if exc is not None:
+        # TimeoutError is expected when the mirror hangs — log at DEBUG to avoid
+        # noise, since the injection already succeeded. Other errors get WARNING.
+        if isinstance(exc, asyncio.TimeoutError):
+            logger.debug("inject-turn mirror for %s timed out (injection unaffected): %s",
+                         session_key, exc)
+        else:
+            logger.warning("inject-turn mirror for %s failed (injection unaffected): %s",
+                           session_key, exc, exc_info=exc)
+
+
+async def _mirror_inject_turn_to_origin_thread(adapter, origin, session_key: str,
+                                               prefixed_text: str) -> None:
+    """Post the injected turn's text into its origin Telegram thread (AC-1, t_30ba8491).
+
+    An injected turn is otherwise invisible on the platform: it enters through
+    the inbound path as a synthetic event, so the topic would show only Hermes's
+    answer with no question. This mirror makes the thread read question -> answer.
+    Called at ADMISSION, BEFORE ``deliver_wake`` enqueues the turn, so the
+    question provably precedes the async answer. The destination is the origin
+    the routing entry already carries — ``chat_id`` plus ``thread_id`` when the
+    session is keyed to a forum topic; a DM-keyed origin mirrors to the DM chat
+    with no thread metadata. Non-Telegram origins are skipped silently (AC-3).
+
+    Failure isolation: the caller has already (or is about to) answer
+    ``accepted:true`` to the bridge client — the mirror is an observation, not a
+    precondition. Every failure mode logs a warning and returns; nothing here
+    may propagate into the injection result.
+
+    THE TRADEOFF — deliberate and recorded (Mark-ruled acceptable):
+
+    The mirrored copy renders under the BOT's identity. A reader sees a Telegram
+    message attributed to Hermes whose text begins "[CLAUDE] ". That is the
+    relay's old convention and is acceptable — but it must be deliberate and
+    recorded: attribution lives in the text prefix, not the Telegram sender
+    field. Any later audit must read the prefix as authoritative, because the
+    sender field is wrong for these rows BY DESIGN. This class-precedent:
+    message 23922 (messages_send, rendered attributed to Hermes) — accidental
+    and unprefixed then; deliberate and prefixed now.
+    """
+    if getattr(origin, "platform", None) != Platform.TELEGRAM:
+        return
+    try:
+        metadata = None
+        thread_id = getattr(origin, "thread_id", None)
+        if thread_id:
+            metadata = {"thread_id": str(thread_id)}
+        result = await adapter.send(origin.chat_id, prefixed_text, metadata=metadata)
+        if result is not None and getattr(result, "success", True) is False:
+            logger.warning(
+                "inject-turn mirror post to %s was not delivered (injection unaffected): %s",
+                session_key, getattr(result, "error", "?"))
+    except Exception as exc:
+        # Never let a mirror failure fail the injection — the client already
+        # holds (or will hold) an accepted answer. Log and move on.
+        logger.warning(
+            "inject-turn mirror post to %s raised (injection unaffected): %s",
+            session_key, exc, exc_info=True)
+
+
 def _make_inject_turn_handler(runner, _main_loop):
     """Build the ``inject-turn`` control-socket verb handler.
 
     Runs the standard inbound path IN THIS PROCESS: resolve the session's live
     routing entry, rebuild its ``SessionSource`` from the persisted origin, and
     push an ``internal=True`` ``MessageEvent`` through the owning adapter's
-    ``handle_message`` — so enqueue and wake are one event. The verb never
-    posts to the platform itself; the agent's REPLY flows out through the
-    adapter exactly as for any real inbound message.
+    ``handle_message`` — so enqueue and wake are one event. The agent's REPLY
+    flows out through the adapter exactly as for any real inbound message. The
+    one outbound post the verb itself makes is the Telegram mirror
+    (``_mirror_inject_turn_to_origin_thread``): at admission, before enqueue, it
+    puts the same prefixed text into the origin thread so the conversation
+    reads question -> answer. That mirror is failure-isolated and never affects
+    the injection result.
     """
 
     def _inject_turn(params: dict) -> dict:
@@ -5103,11 +5180,28 @@ def _make_inject_turn_handler(runner, _main_loop):
 
             source = dataclasses.replace(origin, profile=key_profile)
 
+            # Single source for the prefixed text: the mirror copy and the
+            # enqueued turn are byte-identical and both derive from the
+            # INJECT_TURN_PREFIX constant (AC-2 — no re-typed literal).
+            prefixed_text = INJECT_TURN_PREFIX + text
+
             async def _inject() -> None:
                 from gateway.wake import deliver_wake
                 source._transport_adapter_ref = _weakref.ref(adapter)
+                # Mirror BEFORE enqueue (ordering preserved): schedule the mirror
+                # as a fire-and-forget task on the main loop, so it initiates BEFORE
+                # deliver_wake admits the turn. A hung/failed mirror must NOT block
+                # admission — the client already holds (or will hold) accepted:true.
+                # The mirror is an observation, not a precondition (ISOLATION).
+                mirror_task = asyncio.create_task(
+                    asyncio.wait_for(
+                        _mirror_inject_turn_to_origin_thread(
+                            adapter, origin, session_key, prefixed_text),
+                        timeout=_MIRROR_INJECT_TIMEOUT_SECONDS))
+                mirror_task.add_done_callback(
+                    lambda f: _log_mirror_inject_failure(session_key, f))
                 async with _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source)):
-                    await deliver_wake(adapter, text=INJECT_TURN_PREFIX + text,
+                    await deliver_wake(adapter, text=prefixed_text,
                                        session_id=str(getattr(entry, "session_id", "") or ""),
                                        source=source)
 

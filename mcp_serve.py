@@ -677,9 +677,12 @@ class _ToolHandlers:
         The message enters through the gateway's normal inbound path: it appears
         in the session as a user-role turn (prefixed with "[CLAUDE] " for
         attribution) and Hermes answers it in that same conversation, exactly as
-        if the user had typed it. The conversation must already exist — use
-        conversations_list or events_poll for its session_key. Unknown keys and
-        texts over 20000 characters are refused, never truncated or created.
+        if the user had typed it. For Telegram conversations the turn is also
+        mirrored as a visible message into the origin chat/topic at admission,
+        so the thread reads question -> answer. The conversation must already
+        exist — use conversations_list or events_poll for its session_key.
+        Unknown keys and texts over 20000 characters are refused, never
+        truncated or created.
 
         Args:
             session_key: The session key from conversations_list (exact)
