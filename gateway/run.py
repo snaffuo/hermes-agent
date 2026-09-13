@@ -5003,8 +5003,139 @@ def _start_gateway_claim_pid_file() -> bool:
     return True
 
 
+# Cap for an ``inject-turn`` control-socket payload. A bridge client (MCP
+# ``turns_inject``) sends text written to look like a user turn; oversized
+# payloads are refused outright, never truncated, so what lands in the
+# transcript is exactly what the client sent (up to and including the prefix).
+_INJECT_TURN_MAX_CHARS = 20000
+
+# Attribution prefix stamped on every injected turn. Nothing an MCP bridge
+# client writes may be indistinguishable from the user's own words in a later
+# read (transcript, events_poll, messages_read).
+INJECT_TURN_PREFIX = "[CLAUDE] "
+
+# Bounded wait for the marshal onto the gateway main loop (same 5s budget as the
+# pause/rescan verbs). On timeout the handler reports honest semantics — see
+# _inject_turn's TimeoutError branch.
+_INJECT_TURN_TIMEOUT_SECONDS = 5.0
+
+
+def _log_inject_turn_late_failure(session_key: str):
+    """Done-callback for a pending ``inject-turn`` future: if the coroutine later
+    raises (after we already reported accepted+pending), surface it in the log —
+    a pending answer must not become a silently swallowed failure."""
+
+    def _done(fut) -> None:
+        if fut.cancelled():
+            logger.warning("inject-turn for %s was cancelled before it ran; nothing injected",
+                           session_key)
+            return
+        exc = fut.exception()
+        if exc is not None:
+            logger.warning("inject-turn for %s failed after being reported pending: %s",
+                           session_key, exc, exc_info=exc)
+
+    return _done
+
+
+def _make_inject_turn_handler(runner, _main_loop):
+    """Build the ``inject-turn`` control-socket verb handler.
+
+    Runs the standard inbound path IN THIS PROCESS: resolve the session's live
+    routing entry, rebuild its ``SessionSource`` from the persisted origin, and
+    push an ``internal=True`` ``MessageEvent`` through the owning adapter's
+    ``handle_message`` — so enqueue and wake are one event. The verb never
+    posts to the platform itself; the agent's REPLY flows out through the
+    adapter exactly as for any real inbound message.
+    """
+
+    def _inject_turn(params: dict) -> dict:
+        from gateway.wake import WakeNotAccepted
+        session_key = ""
+        try:
+            if not isinstance(params, dict):
+                return {"ok": False, "error": "request must be a JSON object"}
+            session_key = str(params.get("session_key") or "")
+            text = str(params.get("text") or "")
+            if not session_key or not text.strip():
+                return {"ok": False, "error": "session_key and text are both required"}
+            if len(text) > _INJECT_TURN_MAX_CHARS:
+                # Refuse, never truncate: a silent cut would alter the user-visible turn.
+                return {"ok": False,
+                        "error": f"text too long: {len(text)} chars exceeds cap of {_INJECT_TURN_MAX_CHARS}"}
+
+            # Live routing index lookup — exact key, never nearest-match, never
+            # create. The runner's SessionStore holds every profile's keys in one
+            # process-wide index (per-profile state.db resolution is internal).
+            store = getattr(runner, "session_store", None)
+            entry = store.lookup_by_session_key(session_key) if store is not None else None
+            if entry is None or not getattr(entry, "origin", None):
+                return {"ok": False, "error": f"unknown session_key: {session_key}"}
+            origin = entry.origin
+
+            # Rebuild the adapter's key derivation deterministically: mirror
+            # BasePlatformAdapter._event_session_key (config extras + the owning
+            # adapter's profile namespace), then fence with a source that already
+            # carries the resolved profile so ``_session_key_profile`` short-circuits
+            # to the same value. A derived key that mismatches the requested key is
+            # rejected — the verb can only address the session it was pointed at.
+            adapter = runner._adapter_for_source(origin)
+            if adapter is None:
+                return {"ok": False,
+                        "error": f"no live adapter serving session {session_key} (platform offline?)"}
+            extras = getattr(adapter, "config", None)
+            extras = getattr(extras, "extra", None) if extras is not None else None
+            extras = extras if isinstance(extras, dict) else {}
+            key_profile = (getattr(origin, "profile", None) or "").strip() \
+                or (getattr(adapter, "_owner_profile", None) or "").strip() or None
+            from gateway.session import build_session_key
+            try:
+                derived_key = build_session_key(
+                    origin,
+                    group_sessions_per_user=extras.get("group_sessions_per_user", True),
+                    thread_sessions_per_user=extras.get("thread_sessions_per_user", False),
+                    profile=key_profile)
+            except Exception as exc:
+                return {"ok": False, "error": f"could not derive session key: {exc}"}
+            if derived_key != session_key:
+                return {"ok": False,
+                        "error": f"session key mismatch: origin derives {derived_key!r}, requested {session_key!r}"}
+
+            source = dataclasses.replace(origin, profile=key_profile)
+
+            async def _inject() -> None:
+                from gateway.wake import deliver_wake
+                source._transport_adapter_ref = _weakref.ref(adapter)
+                async with _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source)):
+                    await deliver_wake(adapter, text=INJECT_TURN_PREFIX + text,
+                                       session_id=str(getattr(entry, "session_id", "") or ""),
+                                       source=source)
+
+            future = asyncio.run_coroutine_threadsafe(_inject(), _main_loop)
+            try:
+                future.result(timeout=_INJECT_TURN_TIMEOUT_SECONDS)
+            except concurrent.futures.TimeoutError:
+                # Timeout does NOT mean failure — and we must NOT cancel(): cancelling
+                # can abort the coroutine before admission, which would make any
+                # accepted/pending answer a lie. Once scheduled via
+                # run_coroutine_threadsafe the coroutine is guaranteed to run (absent a
+                # dying loop), and admission is synchronous inside handle_message, so
+                # pending=True is truthful. A late failure is surfaced by the done
+                # callback below — never silently swallowed.
+                future.add_done_callback(_log_inject_turn_late_failure(session_key))
+                return {"ok": True, "accepted": True, "session_key": session_key, "pending": True}
+            return {"ok": True, "accepted": True, "session_key": session_key}
+        except WakeNotAccepted:
+            return {"ok": False, "error": "adapter did not admit the event (session busy or gate closed)"}
+        except Exception as exc:
+            logger.warning("inject-turn failed for %s: %s", session_key or "?", exc, exc_info=True)
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    return _inject_turn
+
+
 async def _start_gateway_start_control_socket(runner):
-    """Start the gateway control socket (identify/status/pause-for-update); None when unavailable."""
+    """Start the gateway control socket (identify/status/pause-for-update/inject-turn); None when unavailable."""
     import atexit
     _control_server = None
     try:
@@ -5045,7 +5176,8 @@ async def _start_gateway_start_control_socket(runner):
                 "pid": os.getpid(), "drain_timeout": _drain}
 
         _control_server = GatewayControlServer(
-            verb_handlers={"pause-for-update": _pause_for_update_handler})
+            verb_handlers={"pause-for-update": _pause_for_update_handler,
+                           "inject-turn": _make_inject_turn_handler(runner, _main_loop)})
         if not await _control_server.start():
             _control_server = None
         else:

@@ -959,7 +959,7 @@ class TestE2EPermissions:
 
 
 # ---------------------------------------------------------------------------
-# 4. TOOL LISTING — verify all 10 tools are registered
+# 4. TOOL LISTING — verify all 11 tools are registered
 # ---------------------------------------------------------------------------
 
 class TestToolRegistration:
@@ -971,7 +971,7 @@ class TestToolRegistration:
         expected = {
             "conversations_list", "conversation_get", "messages_read",
             "attachments_fetch", "events_poll", "events_wait",
-            "messages_send", "channels_list",
+            "messages_send", "turns_inject", "channels_list",
             "permissions_list_open",
         }
         assert expected == tool_names, f"Missing: {expected - tool_names}, Extra: {tool_names - expected}"
@@ -998,6 +998,80 @@ class TestToolRegistration:
         server, _ = mcp_server_e2e
         for tool in server._tool_manager.list_tools():
             assert tool.description, f"Tool {tool.name} has no description"
+
+
+# ---------------------------------------------------------------------------
+# 4b. TURNS_INJECT — control-socket-backed injection
+# ---------------------------------------------------------------------------
+
+class TestTurnsInject:
+    def _wire(self, _unused_server, monkeypatch, reply):
+        """Patch the gateway-socket helper so the tool sees a canned (response, error) pair."""
+        import mcp_serve
+        calls = []
+
+        def fake_query(verb, params, *, timeout=10.0):
+            calls.append((verb, params))
+            return reply
+
+        monkeypatch.setattr(mcp_serve, "_query_gateway_verb", fake_query)
+        return calls
+
+    def test_tool_registered_with_schema(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        tool = next(t for t in server._tool_manager.list_tools() if t.name == "turns_inject")
+        schema = tool.parameters
+        assert set(schema["properties"]) == {"session_key", "text"}
+        assert set(schema["required"]) == {"session_key", "text"}
+
+    def test_successful_injection(self, mcp_server_e2e, _event_loop, monkeypatch):
+        server, _ = mcp_server_e2e
+        calls = self._wire(server, monkeypatch,
+                           ({"ok": True, "result": {"ok": True, "accepted": True,
+                                                     "session_key": "agent:main:telegram:dm:123456"}}, None))
+        out = _run_tool(server, "turns_inject",
+                        {"session_key": "agent:main:telegram:dm:123456", "text": "hello"})
+        assert out["injected"] is True
+        assert calls == [("inject-turn", {"session_key": "agent:main:telegram:dm:123456", "text": "hello"})]
+
+    def test_unknown_session_key_error_propagates(self, mcp_server_e2e, _event_loop, monkeypatch):
+        server, _ = mcp_server_e2e
+        self._wire(server, monkeypatch,
+                   ({"ok": True, "result": {"ok": False, "error": "unknown session_key: nope"}}, None))
+        out = _run_tool(server, "turns_inject", {"session_key": "nope", "text": "hi"})
+        assert "unknown session_key" in out["error"]
+
+    def test_over_length_refusal_propagates(self, mcp_server_e2e, _event_loop, monkeypatch):
+        server, _ = mcp_server_e2e
+        self._wire(server, monkeypatch,
+                   ({"ok": True, "result": {"ok": False,
+                                            "error": "text too long: 30000 chars exceeds cap of 20000"}}, None))
+        # Over the gateway's 20000-char cap but under the wire byte cap: the
+        # refusal must come back from the gateway, verbatim, not be truncated.
+        out = _run_tool(server, "turns_inject", {"session_key": "k", "text": "x" * 30000})
+        assert "text too long" in out["error"] and "exceeds cap" in out["error"]
+
+    def test_wire_byte_cap_refuses_locally(self, mcp_server_e2e, _event_loop, monkeypatch):
+        server, _ = mcp_server_e2e
+        calls = self._wire(server, monkeypatch, ({"ok": True, "result": {"ok": True}}, None))
+        out = _run_tool(server, "turns_inject", {"session_key": "k", "text": "é" * 40000})
+        assert "too large for the control wire" in out["error"]
+        assert calls == []  # refused before touching the socket, never silently dropped
+
+    def test_socket_unreachable_clear_error(self, mcp_server_e2e, _event_loop, monkeypatch):
+        server, _ = mcp_server_e2e
+        self._wire(server, monkeypatch, (None, "No gateway control socket is answering on this machine"))
+        out = _run_tool(server, "turns_inject", {"session_key": "k", "text": "hi"})
+        assert "No gateway control socket" in out["error"]
+
+    def test_blank_args_rejected_without_socket_call(self, mcp_server_e2e, _event_loop, monkeypatch):
+        server, _ = mcp_server_e2e
+        calls = self._wire(server, monkeypatch, ({"ok": True, "result": {"ok": True}}, None))
+        out = _run_tool(server, "turns_inject", {"session_key": "  ", "text": "hi"})
+        assert "session_key is required" in out["error"]
+        out = _run_tool(server, "turns_inject", {"session_key": "k", "text": ""})
+        assert "text is required" in out["error"]
+        assert calls == []
 
 
 # ---------------------------------------------------------------------------
