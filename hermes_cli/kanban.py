@@ -1233,12 +1233,21 @@ def _retitled_suffix(outcome) -> str:
 
 
 def _cmd_specify(args: argparse.Namespace) -> int:
-    """Spec a triage task (or all) via the auxiliary LLM, promote to todo."""
+    """Spec a triage task (or all) via the auxiliary LLM, promote to todo.
+
+    ``--keep-body`` skips the LLM pass and promotes the card verbatim
+    (#110339 body-preserving triage exit)."""
     from hermes_cli import kanban_specify as spec
 
-    return _run_triage_sweep(args, "specify", spec, spec.specify_task, "specified",
-                             ("task_id", "ok", "reason", "new_title"),
-                             lambda o: f"Specified {o.task_id} → todo{_retitled_suffix(o)}")
+    keep_body = bool(getattr(args, "keep_body", False))
+    def _run_one(task_id: str, *, author: str | None = None):
+        return spec.specify_task(task_id, author=author, keep_body=keep_body)
+
+    return _run_triage_sweep(args, "specify", spec, _run_one, "specified",
+                             ("task_id", "ok", "reason", "new_title", "body_preserved"),
+                             lambda o: (f"Specified {o.task_id} → todo (body preserved, verbatim)"
+                                        if o.body_preserved
+                                        else f"Specified {o.task_id} → todo{_retitled_suffix(o)}"))
 
 
 def _decompose_ok_line(o) -> str:

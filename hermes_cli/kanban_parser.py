@@ -403,10 +403,18 @@ _SPECS = [
          help="List known profiles + per-profile task counts (union of ~/.hermes/profiles/ and current assignees on the board)"),
     _cmd("context", [_TASK_ID],
          help="Print the full context a worker sees for a task (title + body + parent results + comments)."),
-    _cmd("specify", _triage_sweep_args("specify", "Specify", "specifier"),
+    _cmd("specify", (*_triage_sweep_args("specify", "Specify", "specifier"),
+                      _arg("--keep-body", action="store_true",
+                           help="Skip the LLM pass entirely and promote the task verbatim: "
+                                "title and body stay byte-identical, only the status moves "
+                                "(triage -> todo). Use when the body is already spec-complete "
+                                "and re-specifying it would lose content (#110339). Recorded "
+                                "on the 'specified' audit event as body_preserved.")),
          help="Flesh out a triage-column task into a concrete spec (title + "
               "body) and promote it to todo. Uses the auxiliary LLM "
-              "configured under auxiliary.triage_specifier."),
+              "configured under auxiliary.triage_specifier. With "
+              "--keep-body the LLM is skipped and the body is preserved "
+              "verbatim."),
     _cmd("decompose", _triage_sweep_args("decompose", "Decompose", "decomposer"),
          help="Decompose a triage-column task into a graph of child tasks "
               "routed to specialist profiles by description. Falls back "

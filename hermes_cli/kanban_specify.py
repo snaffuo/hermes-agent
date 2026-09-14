@@ -2,7 +2,9 @@
 
 ``hermes kanban specify [task_id | --all]`` asks the auxiliary LLM for a
 tightened title + concrete body for a Triage task, then flips it
-``triage -> todo`` via ``kanban_db.specify_triage_task``.
+``triage -> todo`` via ``kanban_db.specify_triage_task``. With ``--keep-body``
+the LLM pass is skipped and the card is promoted verbatim — the body-
+preserving triage exit for already-spec-complete bodies (#110339).
 
 Mirrors ``hermes_cli/goals.py``: same aux-client pattern, same "empty config
 => skip, don't crash" tolerance. One shot, no retry loop. JSON mode is not
@@ -76,6 +78,7 @@ class SpecifyOutcome:
     ok: bool
     reason: str = ""
     new_title: Optional[str] = None
+    body_preserved: bool = False
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -182,13 +185,35 @@ def specify_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    keep_body: bool = False,
 ) -> SpecifyOutcome:
     """Specify one triage task and promote it to ``todo``. Expected failures
     (not in triage, no aux client, API error, malformed reply) surface as
-    ``ok=False`` so an ``--all`` sweep continues."""
+    ``ok=False`` so an ``--all`` sweep continues.
+
+    ``keep_body=True`` is the body-preserving triage exit (#110339): the LLM
+    pass is skipped entirely — the branch sits BEFORE ``_call_aux`` so the exit
+    never imports or depends on the auxiliary client (AC-6). Passing no body
+    means the stored body is only ever read from the raw column inside the DB
+    helper's own txn, never re-sourced from the 4000-char-truncated prompt
+    field, so byte-identity is structural (AC-1).
+    """
     task, reason = _load_triage_task(task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, reason)
+
+    if keep_body:
+        with kbc.connect_closing() as conn:
+            ok = kb.specify_triage_task(
+                conn,
+                task_id,
+                author=author or _profile_author(),
+                preserve_body=True,
+            )
+        if not ok:
+            # Race: promoted/archived between our read and the write.
+            return SpecifyOutcome(task_id, False, "task moved out of triage before promotion")
+        return SpecifyOutcome(task_id, True, "specified (verbatim)", body_preserved=True)
 
     raw, reason = _call_aux(
         "specify", task_id, aux_task="triage_specifier", system=_SYSTEM_PROMPT,
