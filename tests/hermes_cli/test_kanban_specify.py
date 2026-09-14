@@ -93,6 +93,75 @@ def test_specify_task_happy_path(kanban_home):
     assert "**Goal**" in (task.body or "")
 
 
+# ---------------------------------------------------------------------------
+# keep_body — the body-preserving triage exit (#110339)
+# ---------------------------------------------------------------------------
+
+KEEP_BODY = "  **Goal**\nverbatim.\t\n\n**Approach**\n- step  \n" + (
+    "Filler past the 4000-char prompt-field truncation limit. " * 100
+) + "\n  "
+
+
+def test_specify_task_keep_body_skips_llm_entirely(kanban_home):
+    """AC-1/AC-6: the aux client is patched to RAISE — the keep-body path must
+    never reach it (branch is before _call_aux, no import of the aux client),
+    and a >4000-char body lands byte-identical (raw column, never the
+    truncated prompt field)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="keep", body=KEEP_BODY, triage=True)
+
+    boom = MagicMock(side_effect=AssertionError("aux client must not be called"))
+    with patch("agent.auxiliary_client.call_llm", boom):
+        outcome = spec.specify_task(tid, author="ace", keep_body=True)
+
+    assert outcome.ok is True
+    assert outcome.body_preserved is True
+    boom.assert_not_called()
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
+    assert len(KEEP_BODY) > 4000
+    assert task.body == KEEP_BODY
+    assert task.title == "keep"
+    assert events[-1].payload == {"changed_fields": [], "verb": "specify", "body_preserved": True}
+
+
+def test_specify_task_keep_body_survives_aux_unavailable(kanban_home, monkeypatch):
+    """AC-6 literally: aux client genuinely unavailable (import fails), NOT a
+    mocked success — the flag path still exits triage."""
+    import builtins
+    import sys
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="keep", body=KEEP_BODY, triage=True)
+
+    real_import = builtins.__import__
+
+    def no_aux(name, *a, **kw):
+        if name.startswith("agent.auxiliary_client"):
+            raise ImportError("simulated: auxiliary client unavailable")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", no_aux)
+    sys.modules.pop("agent.auxiliary_client", None)
+    try:
+        outcome = spec.specify_task(tid, author="ace", keep_body=True)
+    finally:
+        sys.modules.pop("agent.auxiliary_client", None)
+    assert outcome.ok is True
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).body == KEEP_BODY
+
+
+def test_specify_task_keep_body_rejects_non_triage(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="done already")  # -> ready/todo path
+    outcome = spec.specify_task(tid, author="ace", keep_body=True)
+    assert outcome.ok is False
+    assert "not in triage" in outcome.reason
+
+
+
 
 
 
@@ -137,5 +206,74 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
         assert kb.get_task(conn, outside).status == "triage"
         # The inside task was promoted.
         assert kb.get_task(conn, inside).status in {"todo", "ready"}
+
+
+def test_cli_keep_body_end_to_end(kanban_home, capsys):
+    """AC-2 (CLI, supported verbs only, no LLM): create --triage → specify
+    --keep-body → claim reaches running with the body byte-identical."""
+    rc = _run_cli("create", "keep e2e", "--triage", "--body", KEEP_BODY, "--json")
+    assert rc == 0
+    tid = jsonlib.loads(capsys.readouterr().out)["id"]
+
+    boom = MagicMock(side_effect=AssertionError("aux client must not be called"))
+    with patch("agent.auxiliary_client.call_llm", boom):
+        rc = _run_cli("specify", tid, "--keep-body", "--json")
+    assert rc == 0
+    row = jsonlib.loads(capsys.readouterr().out.strip())
+    assert row == {"task_id": tid, "ok": True, "reason": "specified (verbatim)",
+                   "new_title": None, "body_preserved": True}
+    boom.assert_not_called()
+
+    rc = _run_cli("claim", tid)
+    assert rc == 0
+    capsys.readouterr()
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
+        comments = kb.list_comments(conn, tid)
+    assert task.status == "running"
+    assert task.body == KEEP_BODY
+    # AC-4: the audit event names the verb and records preservation.
+    assert events[-1].payload == {"changed_fields": [], "verb": "specify", "body_preserved": True}
+    assert any("body preserved byte-for-byte" in c.body for c in comments)
+
+
+def test_cli_keep_body_flag_is_specify_only(kanban_home):
+    """AC-3 (parser): --keep-body is specify-only — _triage_sweep_args is
+    shared with decompose, which must NOT gain the flag."""
+    root = argparse.ArgumentParser()
+    subp = root.add_subparsers(dest="cmd")
+    kanban_cli.build_parser(subp)
+    ns = root.parse_args(["kanban", "specify", "t_x", "--keep-body"])
+    assert ns.keep_body is True
+    # decompose never received the flag: argparse must reject it there.
+    with pytest.raises(SystemExit):
+        root.parse_args(["kanban", "decompose", "t_x", "--keep-body"])
+    # specify without the flag defaults it off.
+    ns2 = root.parse_args(["kanban", "specify", "t_x"])
+    assert ns2.keep_body is False
+
+
+def test_cli_llm_path_still_condenses(kanban_home, capsys):
+    """AC-3: specify WITHOUT --keep-body still runs the LLM pass and replaces
+    the body (existing condensing behaviour preserved)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough", body=KEEP_BODY, triage=True)
+    content = jsonlib.dumps({"title": "Condensed", "body": "**Goal**\nshort."})
+    p, mock_fn = _patch_aux_client(content)
+    with p:
+        rc = _run_cli("specify", tid, "--json")
+    assert rc == 0
+    row = jsonlib.loads(capsys.readouterr().out.strip())
+    assert row["ok"] is True
+    assert row["body_preserved"] is False
+    assert mock_fn.called
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.body == "**Goal**\nshort."
+    events = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
+    assert events[-1].payload == {"changed_fields": ["title", "body"]}
+
 
 
