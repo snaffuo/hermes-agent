@@ -12,6 +12,7 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -1736,6 +1737,18 @@ def list_comments_after(
 
 # --- Attachments ---
 
+class AttachmentAnchorError(ValueError):
+    """Raised when the stored blob cannot be hashed at attach time.
+
+    The sha256 anchor is a hard invariant (t_a538586e / Claude ruling
+    2026-09-14): no row may enter ``task_attachments`` without a readable
+    ``sha256`` on its ``attached`` event, so an unreadable/missing blob
+    aborts the whole attach transaction instead of recording a row. A
+    ``ValueError`` so tool/CLI handlers report it cleanly (like
+    :class:`AttachmentTooLarge`) rather than as an unexpected crash.
+    """
+
+
 class AttachmentTooLarge(ValueError):
     """Attachment over the size cap. A ``ValueError`` so generic 400 handlers
     still catch it while the tool/CLI can give a 413-style message."""
@@ -1807,15 +1820,36 @@ def add_attachment(
     now = int(time.time())
     with write_txn(conn):
         _require_task(conn, task_id)
+        # Evidence anchor (t_e47bf446 recon, Claude ruling 2026-09-14, AC-1
+        # every-row hardening per reviewer 2026-09-14): tie the attachment to
+        # the run that produced it at attach time - sha256 into the
+        # attached-event payload, active run id into the event's run_id
+        # column. No new column, no DDL. A row attached with no active run
+        # stays task-scoped (run_id NULL) but still carries its hash. A blob
+        # that cannot be hashed ABORTS the transaction: no row may enter
+        # task_attachments without its sha256.
+        try:
+            att_sha = hashlib.sha256(Path(stored_path).read_bytes()).hexdigest()
+        except OSError as exc:
+            raise AttachmentAnchorError(
+                f"cannot anchor attachment to stored blob: {stored_path}"
+            ) from exc
         cur = conn.execute(
             "INSERT INTO task_attachments "
             "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (task_id, filename.strip(), stored_path, content_type, int(size), uploaded_by, now),
         )
+        run_id = _current_run_id(conn, task_id)
         _append_event(
             conn, task_id, "attached",
-            {"filename": filename.strip(), "size": int(size), "by": uploaded_by},
+            {
+                "filename": filename.strip(),
+                "size": int(size),
+                "by": uploaded_by,
+                "sha256": att_sha,
+            },
+            run_id=run_id,
         )
         return int(cur.lastrowid or 0)
 
@@ -2856,13 +2890,36 @@ def _insert_completion_attachment(
     created_at: int,
 ) -> None:
     """Record a worker-produced artifact in the existing attachment table."""
+    # Evidence anchor (t_e47bf446 recon, Claude ruling 2026-09-14, AC-1
+    # every-row hardening per reviewer 2026-09-14): same tie as
+    # add_attachment - sha256 in the payload, the completing run's id in the
+    # event's run_id column. complete_task calls this BEFORE _end_run, so
+    # current_run_id still resolves; no terminal-status metadata write. An
+    # unreadable blob aborts completion: no unanchored row enters
+    # task_attachments.
+    try:
+        att_sha = hashlib.sha256(Path(stored_path).read_bytes()).hexdigest()
+    except OSError as exc:
+        raise AttachmentAnchorError(
+            f"cannot anchor completion artifact attachment to stored blob: {stored_path}"
+        ) from exc
     conn.execute(
         "INSERT INTO task_attachments "
         "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
         "VALUES (?, ?, ?, NULL, ?, 'kanban_complete', ?)",
         (task_id, filename, stored_path, size, created_at),
     )
-    _append_event(conn, task_id, "attached", {"filename": filename, "size": size, "by": "kanban_complete"})
+    run_id = _current_run_id(conn, task_id)
+    _append_event(
+        conn, task_id, "attached",
+        {
+            "filename": filename,
+            "size": size,
+            "by": "kanban_complete",
+            "sha256": att_sha,
+        },
+        run_id=run_id,
+    )
 
 
 def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
