@@ -1684,6 +1684,29 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
         return int(cur.lastrowid or 0)
 
 
+def log_author_override(
+    conn: sqlite3.Connection, task_id: str, *, verb: str, declared_author: str,
+    profile_identity: str, run_id: Optional[int] = None,
+) -> None:
+    """Audit event for a deliberate operator author override (#110081).
+
+    Emitted when a CLI comment/attach is stored under a ``--author`` that does
+    not match the calling profile's derived identity, only after the operator
+    passed ``--as-operator`` from an interactive shell. The event records both
+    identities and the verb so the audit trail shows exactly who impersonated
+    whom by choice, not by spoof. Goes through ``write_txn`` like every other
+    durable write.
+    """
+    with write_txn(conn, allow_nested=True):
+        _require_task(conn, task_id)
+        _append_event(
+            conn, task_id, "author_override",
+            {"verb": verb, "declared_author": declared_author,
+             "profile_identity": profile_identity},
+            run_id=run_id,
+        )
+
+
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
     if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
         raise ValueError(f"unknown task {task_id}")

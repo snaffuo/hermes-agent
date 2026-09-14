@@ -211,6 +211,55 @@ def _profile_author() -> str:
         return "user"
 
 
+_OPERATOR_OVERRIDE_FLAG = "--as-operator"
+
+
+def _resolve_cli_author(args: argparse.Namespace, *, verb: str) -> tuple[str, Optional[int], bool]:
+    """Validate ``--author`` against the derived profile identity (#110081).
+
+    The tool path (``tools/kanban_tools.py``) derives comment authorship from
+    ``HERMES_PROFILE`` and ignores caller-supplied identity because comments are
+    injected into future workers' system prompts — a free-text author could
+    forge a directive from an authoritative-looking name. The CLI path carried
+    the same forgery class unhardened: ``--author reviewer`` from any other
+    profile stored a comment claiming reviewer authorship.
+
+    Rules (``verb`` is only used for error text):
+    - No ``--author``: the derived identity is used — unchanged behavior.
+    - ``--author`` matching the derived identity (casefold-insensitive): kept
+      as declared (legit scripted usage, e.g. ``attach --author coder`` in a
+      coder session).
+    - Mismatch without ``--as-operator``: REFUSED; the message names the
+      correct invocation.
+    - Mismatch with ``--as-operator`` from an interactive shell (no
+      ``HERMES_KANBAN_TASK`` context): permitted; the handler records an
+      ``author_override`` audit event (see ``kanban_db.log_author_override``).
+      Worker-scoped sessions cannot override: their identity IS their grant.
+
+    Returns ``(author, rc, operator_override)``; ``rc`` non-None means the verb
+    was refused and the handler must return it.
+    """
+    derived = _profile_author()
+    declared = (getattr(args, "author", None) or "").strip()
+    if not declared:
+        return derived, None, False
+    if declared.casefold() == derived.casefold():
+        return declared, None, False
+    if getattr(args, "as_operator", False):
+        task_ctx = os.environ.get("HERMES_KANBAN_TASK")
+        if task_ctx:
+            return "", _err(
+                f"kanban: {_OPERATOR_OVERRIDE_FLAG} is only valid from an interactive operator "
+                f"shell; this session is worker-scoped to task {task_ctx}. Re-run without "
+                f"--author to record the {verb} under '{derived}'."), False
+        return declared, None, True
+    return "", _err(
+        f"kanban: --author '{declared}' does not match the calling profile identity "
+        f"'{derived}'; refusing to record the {verb} under a foreign author. Re-run without "
+        f"--author to record it as '{derived}', or pass {_OPERATOR_OVERRIDE_FLAG} for a "
+        f"deliberate operator-posted {verb} (records an author_override audit event)."), False
+
+
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
@@ -733,10 +782,21 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         if len(body) > args.max_len:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
-    author = args.author or _profile_author()
+    author, rc, operator_override = _resolve_cli_author(args, verb="comment")
+    if rc is not None:
+        return rc
     with kbc.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
-    print(f"Comment added to {args.task_id}")
+        if operator_override:
+            # One txn for comment + audit row so the audit trail can never have a
+            # forged-author comment without its author_override event (crash-atomic).
+            with kbc.write_txn(conn, allow_nested=True):
+                cid = kb.add_comment(conn, args.task_id, author, body)
+                kb.log_author_override(conn, args.task_id, verb="comment",
+                                       declared_author=author, profile_identity=_profile_author())
+        else:
+            cid = kb.add_comment(conn, args.task_id, author, body)
+    print(f"Comment added to {args.task_id} (author={author}, comment {cid}"
+          f"{'; operator override audited' if operator_override else ''})")
     return 0
 
 
@@ -752,14 +812,26 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     data = src.read_bytes()
     name = args.name or src.name
     content_type = args.content_type or mimetypes.guess_type(name)[0]
-    uploaded_by = args.author or _profile_author()
+    uploaded_by, rc, operator_override = _resolve_cli_author(args, verb="attachment")
+    if rc is not None:
+        return rc
     try:
         with kbc.connect_closing() as conn:
+            if operator_override:
+                # Audit BEFORE the row: store_attachment_bytes manages its own
+                # txn + blob write (not nestable), so crash-atomicity isn't
+                # available here — the safe ordering is an audit event that may
+                # exist without the attachment, never a foreign-author
+                # attachment without its audit event.
+                kb.log_author_override(conn, args.task_id, verb="attach",
+                                       declared_author=uploaded_by,
+                                       profile_identity=_profile_author())
             att_id = kb.store_attachment_bytes(conn, args.task_id, name, data, content_type=content_type,
                                                uploaded_by=uploaded_by)
     except kb.AttachmentTooLarge as exc:
         return _err(f"kanban: {exc}")
-    print(f"Attached {name} to {args.task_id} (attachment {att_id}, {len(data)} bytes)")
+    print(f"Attached {name} to {args.task_id} (attachment {att_id}, {len(data)} bytes, "
+          f"by {uploaded_by}{'; operator override audited' if operator_override else ''})")
     return 0
 
 
