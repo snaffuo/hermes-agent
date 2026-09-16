@@ -257,3 +257,37 @@ def test_no_new_column_on_task_attachments(kanban_home):
         "id", "task_id", "filename", "stored_path", "content_type",
         "size", "uploaded_by", "created_at",
     ]
+
+
+# ---------------------------------------------------------------------------
+# B-3b invariant (ruling on HALT B, 2026-09-16): the 'attached' event's
+# payload["by"] is the SAME value as its attachment row's uploaded_by —
+# one value, two places. Asserted as equality, not a literal: a new caller
+# must keep the event and the row in agreement, whatever it calls itself.
+# Fires on the handover path (kanban_request_review), where the event would
+# otherwise contradict the row it describes.
+# ---------------------------------------------------------------------------
+
+def test_attached_event_by_matches_row_uploaded_by_on_request_review(kanban_home):
+    blob = b"handover-artifact-bytes"
+    with kbc.connect() as conn:
+        t = _task_with_ready_task(conn)
+        ws = kbw.resolve_workspace(kb.get_task(conn, t))
+        kbw.set_workspace_path(conn, t, ws)
+        kb.claim_task(conn, t, claimer="coder")
+
+        artifact = ws / "handoff.txt"
+        artifact.write_bytes(blob)
+        assert kb.request_review(
+            conn, t, summary="handover for invariant test",
+            metadata={"artifacts": [str(artifact)]},
+            expected_run_id=kb.latest_run(conn, t).id,
+        )
+
+        events = _attached_events(conn, t)
+        atts = kb.list_attachments(conn, t)
+
+    assert len(atts) == 1
+    assert len(events) == 1
+    assert events[0].payload["by"] == atts[0].uploaded_by
+    assert events[0].payload["sha256"] == hashlib.sha256(blob).hexdigest()
