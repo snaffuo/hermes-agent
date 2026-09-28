@@ -2531,10 +2531,27 @@ def _hermes_path_argv(path: str) -> list[str]:
     return [_absolute_hermes_path(path)]
 
 
+def _install_root() -> Path:
+    """Root of the install this module was imported from."""
+    return Path(__file__).resolve().parents[1]
+
+
+def _published_launcher() -> Optional[str]:
+    """``<root>/.hermes/bin/hermes``, the source install's child-safe launcher
+    (``_launchers.installation_command``), when it exists and is executable.
+    A launcher-booted parent imports ``hermes_cli`` only via its bootstrap's
+    ``sys.path``; a bare ``sys.executable -m`` child cannot (#160)."""
+    if _kb._IS_WINDOWS:
+        return None
+    launcher = _install_root() / ".hermes" / "bin" / "hermes"
+    return str(launcher) if launcher.is_file() and os.access(launcher, os.X_OK) else None
+
+
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
     (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
+    same-directory file), then this install's published launcher, then the
+    running interpreter's ``sys.executable -m
     hermes_cli.main`` (exactly this install; also covers shim-less cron,
     systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
     search, batch shims fall back to the module form) only when ``hermes_cli``
@@ -2557,7 +2574,8 @@ def _resolve_hermes_argv() -> list[str]:
 
     try:
         if importlib.util.find_spec("hermes_cli") is not None:
-            return _module_hermes_argv()
+            launcher = _published_launcher()
+            return [launcher] if launcher else _module_hermes_argv()
     except Exception:
         pass
 
