@@ -1118,12 +1118,16 @@ def _validate_model_override(model: Optional[str], provider: Optional[str]) -> t
 
 
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
-    """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
+    """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity).
+
+    A leading ``@`` is stripped (``@reviewer`` -> ``reviewer``): a mention-style
+    assignee matches no profile and would sit in ``ready`` unclaimed.
+    """
     if assignee is None:
         return None
     from hermes_cli.profiles import normalize_profile_name
 
-    return normalize_profile_name(assignee)
+    return normalize_profile_name(str(assignee).strip().removeprefix("@"))
 
 
 def _resolve_project_link(
