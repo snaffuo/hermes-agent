@@ -127,6 +127,26 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
+def _undeclared_scratch_files(
+    conn: sqlite3.Connection, task_id: str, declared: list[str],
+) -> list[str]:
+    """Workspace-relative files in a managed scratch workspace that are neither
+    in *declared* nor already attached by name; cleanup will delete them."""
+    ws = _scratch_workspace(conn, task_id)
+    if ws is None or not ws.is_dir() or not _is_managed_scratch_path(ws):
+        return []
+    keep = {Path(p).expanduser().resolve(strict=False) for p in declared}
+    attached = {a.filename for a in _kb.list_attachments(conn, task_id)}
+    try:
+        return sorted(
+            f.relative_to(ws).as_posix() for f in ws.rglob("*")
+            if f.is_file() and f.name not in attached
+            and f.resolve(strict=False) not in keep
+        )
+    except OSError:
+        return []
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort

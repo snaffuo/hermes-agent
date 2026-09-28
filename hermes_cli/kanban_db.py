@@ -2819,6 +2819,7 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    declared = _cleaned_artifact_paths(metadata)  # staging rewrites metadata["artifacts"]
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
@@ -2885,7 +2886,17 @@ def complete_task(
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
     recompute_ready(conn)  # separate txn so children see ``done``
+    undeclared = _undeclared_scratch_files(conn, task_id, declared)
+    workspace = _scratch_workspace(conn, task_id)
     _cleanup_workspace(conn, task_id)
+    if undeclared and workspace is not None and not workspace.exists():
+        # GC semantics unchanged; the loss is recorded, not silent (sirron-terminal#106).
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "workspace_undeclared_removed",
+                {"count": len(undeclared), "files": undeclared[:_UNDECLARED_FILES_CAP]},
+                run_id=run_id,
+            )
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
@@ -2893,6 +2904,7 @@ def complete_task(
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
+_UNDECLARED_FILES_CAP = 20
 
 
 def _gate_created_cards(
@@ -4589,6 +4601,7 @@ from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,
+    _undeclared_scratch_files,
 )
 from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_FAILURE_LIMIT,

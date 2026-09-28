@@ -847,6 +847,39 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+def test_complete_task_records_undeclared_scratch_files_it_removes(kanban_home):
+    """Undeclared scratch files still go with the workspace, but the loss is
+    recorded as an event instead of being silent (sirron-terminal#106)."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="capture evidence")
+        ws = kbw.resolve_workspace(kb.get_task(conn, t))
+        kbw.set_workspace_path(conn, t, ws)
+        (ws / "diff.patch").write_bytes(b"diff")
+        (ws / "captures").mkdir()
+        (ws / "captures" / "probe.txt").write_bytes(b"stdout")
+        (ws / "notes.md").write_bytes(b"notes")
+        assert kb.complete_task(
+            conn, t, result="ok", metadata={"artifacts": [str(ws / "diff.patch")]},
+        )
+        events = [e for e in kb.list_events(conn, t) if e.kind == "workspace_undeclared_removed"]
+        run = kb.latest_run(conn, t)
+    assert not ws.exists(), "cleanup semantics are unchanged"
+    assert len(events) == 1
+    assert events[0].payload == {"count": 2, "files": ["captures/probe.txt", "notes.md"]}
+    assert events[0].run_id == run.id
+
+
+def test_complete_task_records_nothing_when_every_file_is_declared(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="all declared")
+        ws = kbw.resolve_workspace(kb.get_task(conn, t))
+        kbw.set_workspace_path(conn, t, ws)
+        (ws / "out.txt").write_bytes(b"x")
+        assert kb.complete_task(conn, t, result="ok", metadata={"artifacts": [str(ws / "out.txt")]})
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+    assert "workspace_undeclared_removed" not in kinds
+
+
 def test_review_bound_handoff_preserves_declared_artifacts(kanban_home):
     """A review-bound card's declared files must outlive the reviewer's
     completion — that completion is what cleans the scratch workspace up."""

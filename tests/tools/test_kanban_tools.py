@@ -196,6 +196,26 @@ def test_complete_reports_registered_attachments(worker_env):
     assert readback["attachments"] == d["attachments"]
 
 
+def test_complete_warns_about_undeclared_scratch_files_it_removed(worker_env):
+    """sirron-terminal#106: completion still GCs the scratch workspace, but the
+    result tells the worker which undeclared files went with it."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_workspace as kbw
+    from tools import kanban_tools as kt
+
+    with kbc.connect() as conn:
+        ws = kbw.resolve_workspace(kb.get_task(conn, worker_env))
+        kbw.set_workspace_path(conn, worker_env, ws)
+    (ws / "diff.patch").write_bytes(b"d")
+    (ws / "probe.log").write_bytes(b"p")
+
+    d = json.loads(kt._handle_complete({"summary": "done", "artifacts": [str(ws / "diff.patch")]}))
+    assert d["ok"] is True, d
+    assert d["warning"] == (
+        "1 undeclared file(s) in the scratch workspace were removed at completion: probe.log")
+
+
 def test_request_review_rejects_unknown_reviewer_without_mutation(monkeypatch, worker_env, tmp_path):
     """#106163: a non-profile ``reviewer`` (e.g. the literal "reviewer") must be
     refused with an error the model sees, leaving the task running under the

@@ -766,10 +766,19 @@ def _handle_complete(args: dict, **kw) -> str:
         # read `kanban_attachments` before completing saw an empty list and has
         # no way to observe what its completion just registered (#117360).
         # Report the card's durable attachment set in the result.
+        extra: dict = {}
+        removed = [e for e in kb.list_events(conn, tid)
+                   if e.kind == "workspace_undeclared_removed"
+                   and e.run_id == (run.id if run else None)]
+        if removed and isinstance(removed[-1].payload, dict):
+            p = removed[-1].payload
+            extra["warning"] = (
+                f"{p.get('count')} undeclared file(s) in the scratch workspace were "
+                f"removed at completion: {', '.join(p.get('files') or [])}")
         return _ok(task_id=tid, run_id=run.id if run else None,
                    attachments=[
                        _fields(a, _ATTACHMENT_FIELDS)
-                       for a in kb.list_attachments(conn, tid)])
+                       for a in kb.list_attachments(conn, tid)], **extra)
 
 
 @_kanban_handler("kanban_block")
