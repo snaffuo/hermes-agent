@@ -2008,3 +2008,19 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+def test_leading_at_is_stripped_from_assignee_on_create_and_assign(kanban_home):
+    """#133: ``@reviewer`` must land as ``reviewer`` so the dispatcher can claim it."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="verdict", assignee="@Reviewer")
+        assert kb.get_task(conn, tid).assignee == "reviewer"
+        assert kb.assign_task(conn, tid, " @coder")
+        assert kb.get_task(conn, tid).assignee == "coder"
+        assert [t.id for t in kb.list_tasks(conn, assignee="@coder")] == [tid]
+        # Only the leading marker goes; an unknown non-profile lane is still accepted.
+        assert kb.assign_task(conn, tid, "ops@lane")
+        assert kb.get_task(conn, tid).assignee == "ops@lane"
+    finally:
+        conn.close()
