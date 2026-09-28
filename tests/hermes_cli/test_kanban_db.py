@@ -1592,6 +1592,30 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX launcher wrapper")
+def test_resolve_hermes_argv_prefers_published_launcher_over_module_form(monkeypatch, tmp_path):
+    """#160: a launcher-booted gateway can import ``hermes_cli`` only through the
+    bootstrap's sys.path, which a bare ``sys.executable -m`` child does not get.
+    The install's published ``<root>/.hermes/bin/hermes`` must win over the
+    module form; ``$HERMES_BIN`` still overrides both."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(kbd, "_install_root", lambda: tmp_path, raising=False)
+    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+
+    launcher = tmp_path / ".hermes" / "bin" / "hermes"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]  # not executable
+
+    launcher.chmod(0o755)
+    assert kbd._resolve_hermes_argv() == [str(launcher)]
+
+    monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
+    assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
+
+
 
 
 def test_resolve_hermes_argv_module_actually_runs():
