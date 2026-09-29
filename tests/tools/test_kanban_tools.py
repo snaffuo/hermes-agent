@@ -196,6 +196,65 @@ def test_complete_reports_registered_attachments(worker_env):
     assert readback["attachments"] == d["attachments"]
 
 
+def _scratch_artifact(task_id, name, data):
+    """Write ``data`` into the task's managed scratch workspace; return the path."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_workspace as kbw
+
+    with kbc.connect() as conn:
+        ws = kbw.resolve_workspace(kb.get_task(conn, task_id))
+        kbw.set_workspace_path(conn, task_id, ws)
+    artifact = ws / name
+    artifact.write_bytes(data)
+    return artifact
+
+
+def test_complete_reports_attachment_sha256_and_accepts_matching_expected(worker_env):
+    """snaffuo/sirron-terminal#112: each returned attachment carries the sha256
+    of its stored bytes; a matching ``expected_sha256`` (any hex case) passes."""
+    import hashlib
+    from pathlib import Path
+
+    from tools import kanban_tools as kt
+
+    data = b"evidence bytes\n"
+    digest = hashlib.sha256(data).hexdigest()
+    artifact = _scratch_artifact(worker_env, "evidence.out", data)
+    d = json.loads(kt._handle_complete({
+        "summary": "done", "artifacts": [str(artifact)],
+        "expected_sha256": {str(artifact): digest.upper()},
+    }))
+    assert d["ok"] is True, d
+    [att] = d["attachments"]
+    assert att["sha256"] == digest
+    assert hashlib.sha256(Path(att["stored_path"]).read_bytes()).hexdigest() == att["sha256"]
+
+
+@pytest.mark.parametrize("bad_key", [False, True])
+def test_complete_expected_sha256_refusal_leaves_task_untouched(worker_env, bad_key):
+    """A mismatched hash, or a key that is not a declared artifact, refuses the
+    whole completion: error names the path, card stays running, nothing stored."""
+    import hashlib
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    artifact = _scratch_artifact(worker_env, "evidence.out", b"actual")
+    wrong = "0" * 64
+    key = str(artifact.with_name("undeclared.out")) if bad_key else str(artifact)
+    d = json.loads(kt._handle_complete({
+        "summary": "done", "artifacts": [str(artifact)], "expected_sha256": {key: wrong},
+    }))
+    assert "error" in d and key in d["error"], d
+    if not bad_key:
+        assert wrong in d["error"] and hashlib.sha256(b"actual").hexdigest() in d["error"]
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+        assert kb.list_attachments(conn, worker_env) == []
+
+
 def test_request_review_rejects_unknown_reviewer_without_mutation(monkeypatch, worker_env, tmp_path):
     """#106163: a non-profile ``reviewer`` (e.g. the literal "reviewer") must be
     refused with an error the model sees, leaving the task running under the

@@ -8,6 +8,7 @@ shlex quoting of JSON metadata, structured-JSON failures). Humans use CLI/dashbo
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -408,6 +409,35 @@ _ATTACHMENT_FIELDS = tuple(
 _CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
 
 
+def _sha256_file(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.file_digest(fh, "sha256").hexdigest()
+
+
+def _attachment_dict(att: Any) -> dict[str, Any]:
+    """Attachment fields plus ``sha256`` of the stored bytes (None if unreadable)."""
+    try:
+        sha = _sha256_file(att.stored_path)
+    except OSError:
+        sha = None
+    return {**_fields(att, _ATTACHMENT_FIELDS), "sha256": sha}
+
+
+def _check_expected_sha256(expected: Any, artifacts: Optional[list[str]]) -> None:
+    """Refuse, before any side effect, unless each entry is a declared artifact with that hash."""
+    _check(isinstance(expected, dict), "expected_sha256 must be an object: artifact path -> hex")
+    for path, want in expected.items():
+        path, want = str(path).strip(), str(want).strip().lower()
+        _check(path in (artifacts or []), f"kanban_complete refused: expected_sha256 key "
+               f"{path!r} is not one of the declared artifacts. Nothing changed.")
+        try:
+            actual = _sha256_file(os.path.expanduser(path))
+        except OSError as exc:
+            actual = f"unreadable ({exc})"
+        _check(actual == want, f"kanban_complete refused: sha256 mismatch for {path}: expected "
+               f"{want}, actual {actual}. Nothing stored; the task is still in-flight.")
+
+
 def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
     """``{name: getattr(obj, name)}``; every value None when ``obj`` is None."""
     return {n: getattr(obj, n) if obj is not None else None for n in names}
@@ -699,6 +729,8 @@ def _handle_complete(args: dict, **kw) -> str:
     created_cards = _coerce_str_list(
         args.get("created_cards"), "created_cards", "task ids", strip=True)
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)
+    if args.get("expected_sha256") is not None:
+        _check_expected_sha256(args["expected_sha256"], artifacts)
     if artifacts:
         metadata = _merge_artifacts(metadata, artifacts)
     _check(summary or result, "provide at least one of: summary (preferred), result")
@@ -767,9 +799,7 @@ def _handle_complete(args: dict, **kw) -> str:
         # no way to observe what its completion just registered (#117360).
         # Report the card's durable attachment set in the result.
         return _ok(task_id=tid, run_id=run.id if run else None,
-                   attachments=[
-                       _fields(a, _ATTACHMENT_FIELDS)
-                       for a in kb.list_attachments(conn, tid)])
+                   attachments=[_attachment_dict(a) for a in kb.list_attachments(conn, tid)])
 
 
 @_kanban_handler("kanban_block")
@@ -1008,7 +1038,7 @@ def _handle_attachments(args: dict, **kw) -> str:
         return json.dumps({
             "ok": True, "task_id": tid,
             "attachments": [
-                _fields(a, _ATTACHMENT_FIELDS) for a in kb.list_attachments(conn, tid)]})
+                _attachment_dict(a) for a in kb.list_attachments(conn, tid)]})
 
 
 def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:

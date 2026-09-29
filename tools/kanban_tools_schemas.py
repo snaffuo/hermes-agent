@@ -160,6 +160,15 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "task in-flight so you can fix the path and retry."
             ),
         },
+        "expected_sha256": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": (
+                "Optional map: artifact path (as given in artifacts) -> sha256 hex. "
+                "A mismatch or undeclared path refuses the whole completion; nothing "
+                "is stored. Returned attachments carry sha256 of the stored bytes."
+            ),
+        },
     },
     [],
 )
