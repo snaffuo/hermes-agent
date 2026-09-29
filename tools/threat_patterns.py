@@ -21,6 +21,21 @@ _FILLER = r"(?:\w+\s+){0,8}"
 _SECRET_VAR = r"\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)S?\b"
 # Verb prefix for "modify agent config" patterns.
 _MODIFY = r"(update|modify|edit|write|change|append|add\s+to)\s+[^\n]{0,2048}"
+# Verb / redirect / ``open(`` prefix shared by the credential-PATH guards
+# (``ssh_access``, ``hermes_env``). A bare path match flagged ordinary docs
+# ("check $HOME/.ssh is chmod 700"), so a path pattern fires only when the same
+# line also acts on the path: a read/copy/write/send verb, a redirect, or
+# ``open(``. ``>>?`` covers a leading redirect with no verb word; ``open(`` covers
+# the scripted-write shape; chmod/chown/sed/truncate/rm/touch/curl/wget/git mutate
+# the file without an obvious copy verb; grep/awk cover the read shapes read_secrets
+# (which only knows ``cat``) misses. One list, so the two guards cannot drift
+# apart — both are credential-path guards and both are honesty-critical (#140).
+_PATH_WRITE_VERB = (
+    r"(?:\b(?:echo|cat|cp|mv|dd|tee|install|printf|rsync|scp|ln|append|add|write"
+    r"|sed|grep|awk|chmod|chown|truncate|rm|touch|curl|wget|git)\b|\bopen\s*\(|>>?)"
+)
+# Pattern whose MATCH is the credential: its text is never echoed in a refusal (#140).
+_CREDENTIAL_MATCH_PID = "hardcoded_secret"
 # (regex, pattern_id, scope); scope ∈ {"all", "context", "strict"}
 _PATTERNS: List[Tuple[str, str, str]] = [
     # ── Classic prompt injection (applies everywhere) ────────────────
@@ -78,16 +93,18 @@ _PATTERNS: List[Tuple[str, str, str]] = [
     (r'(send|post|upload|transmit)\s+[^\n]{0,2048}\s+(to|at)\s+https?://', "send_to_url", "strict"),
     (rf'(include|output|print|share)\s+{_FILLER}(conversation|chat\s+history|previous\s+messages|full\s+context|entire\s+context)', "context_exfil", "strict"),
 
-    # ── Persistence / SSH backdoor (strict scope — memory + skills) ──
+    # ── Persistence / SSH backdoor and credential paths (strict scope — memory + skills) ──
     (r'authorized_keys', "ssh_backdoor", "strict"),
-    # Write-verb gated like the *_config_mod rules: a bare path match blocked ordinary docs
-    # ("check $HOME/.ssh is chmod 700"). ``>>?`` covers a leading redirect with no verb word;
-    # ``open(`` covers the scripted-write shape; chmod/chown/sed/truncate/rm/touch/curl/wget/git
-    # mutate the directory without an obvious copy verb.
-    (r'(?:\b(?:echo|cat|cp|mv|dd|tee|install|printf|rsync|scp|ln|append|add|write'
-     r'|sed|chmod|chown|truncate|rm|touch|curl|wget|git)\b|\bopen\s*\(|>>?)'
-     r'[^\n]{0,512}(?:\$HOME/\.ssh|~/\.ssh)', "ssh_access", "strict"),
-    (r'\$HOME/\.hermes/\.env|\~/\.hermes/\.env', "hermes_env", "strict"),
+    # Both path guards are write-verb gated (see _PATH_WRITE_VERB). ssh_access was
+    # narrowed first; hermes_env kept a bare path match until issue #140, where a
+    # legitimate memory write that merely named the file ("the token lives in
+    # ~/.hermes/.env") was refused with no way to see what had matched.
+    (rf'{_PATH_WRITE_VERB}[^\n]{{0,512}}(?:\$HOME/\.ssh|~/\.ssh)', "ssh_access", "strict"),
+    # Acting on the file is still caught without this pattern: read_secrets ("all"
+    # scope) catches `cat … .env`, and exfil_curl / exfil_wget catch sending secret
+    # variables. Scope is strict (memory + skills) — that is where the verb-gated
+    # forms now decide, and where a plain mention must pass.
+    (rf'{_PATH_WRITE_VERB}[^\n]{{0,512}}(?:\$HOME/\.hermes/\.env|~/\.hermes/\.env)', "hermes_env", "strict"),
     (rf'{_MODIFY}(?:AGENTS\.md|CLAUDE\.md|\.cursorrules|\.clinerules)', "agent_config_mod", "strict"),
     (rf'{_MODIFY}\.hermes/(config\.yaml|SOUL\.md)', "hermes_config_mod", "strict"),
 
@@ -145,6 +162,28 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     return findings
 
 
+def _matched_text(pid: str, content: str, scope: str, limit: int = 80) -> Optional[str]:
+    """The text that matched ``pid`` (whitespace-collapsed, truncated), or None.
+
+    Diagnostics only: a refusal used to name the pattern id and nothing else, so a
+    writer could not tell which phrase to rephrase (#140). The match for
+    ``hardcoded_secret`` IS the credential, so that text is never echoed — the
+    refusal names the pattern and says the match was suppressed.
+    """
+    if pid == _CREDENTIAL_MATCH_PID:
+        return "[suppressed: the matched text is the credential itself]"
+    normalised = unicodedata.normalize("NFKC", content[:MAX_SCAN_CHARS])
+    for compiled, cpid in _COMPILED.get(scope, []):
+        if cpid != pid:
+            continue
+        found = compiled.search(normalised)
+        if found is None:
+            return None
+        text = " ".join(found.group(0).split())
+        return text if len(text) <= limit else text[:limit] + "…"
+    return None
+
+
 def first_threat_message(content: str, scope: str = "strict") -> Optional[str]:
     """User-facing error for the first threat found, or None (block-on-first-hit paths)."""
     findings = scan_for_threats(content, scope=scope)
@@ -154,7 +193,9 @@ def first_threat_message(content: str, scope: str = "strict") -> Optional[str]:
     if pid.startswith("invisible_unicode_"):
         codepoint = pid.replace("invisible_unicode_", "")
         return f"Blocked: content contains invisible unicode character {codepoint} (possible injection)."
-    return (f"Blocked: content matches threat pattern '{pid}'. "
+    matched = _matched_text(pid, content, scope)
+    near = f" near: {matched!r}" if matched else ""
+    return (f"Blocked: content matches threat pattern '{pid}'{near}. "
             f"Content is injected into the system prompt and must not contain "
             f"injection or exfiltration payloads.")
 
