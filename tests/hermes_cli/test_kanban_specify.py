@@ -69,6 +69,33 @@ def _patch_aux_client(content: str, *, model: str = "test-model"):
 # specify_task (module-level entry point)
 # ---------------------------------------------------------------------------
 
+def test_specify_task_empty_response_records_cause(kanban_home, caplog):
+    """#81: an empty reply must name its cause (model, finish_reason, reasoning, usage)."""
+    from types import SimpleNamespace as NS
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+    resp = NS(
+        model="glm-test",
+        choices=[NS(finish_reason="length", message=NS(content=None, reasoning_content="x" * 42))],
+        usage=NS(completion_tokens=6000, prompt_tokens=1314),
+    )
+    with patch("agent.auxiliary_client.call_llm", MagicMock(return_value=resp)), \
+            caplog.at_level("WARNING", logger=spec.logger.name):
+        outcome = spec.specify_task(tid)
+    assert outcome.ok is False
+    assert outcome.reason.startswith("LLM returned an empty response (")
+    for needle in ("model=glm-test", "finish_reason=length", "reasoning_content present (42 chars)",
+                   "completion_tokens=6000", "prompt_tokens=1314"):
+        assert needle in outcome.reason
+    assert "finish_reason=length" in caplog.text
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_diagnose_empty_never_raises():
+    assert "diagnostics unavailable" in spec._diagnose_empty(object())
+
+
 def test_specify_task_happy_path(kanban_home):
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="rough", triage=True)
