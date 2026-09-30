@@ -886,6 +886,54 @@ def test_home_channels_lists_only_platforms_with_home(client, with_home_channels
     for h in r.json()["home_channels"]:
         assert h["subscribed"] is False
 
+def _write_default_notify_platform(platform):
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
+        f"dashboard:\n  kanban:\n    default_notify_platform: {platform}\n")
+
+def _notify_subs(task_id):
+    from hermes_cli import kanban_db_notify as kbn
+    conn = kbc.connect()
+    try:
+        return kbn.list_notify_subs(conn, task_id)
+    finally:
+        conn.close()
+
+def test_create_subscribes_default_notify_platform_home(client, with_home_channels):
+    """A dashboard create with no inherited sub subscribes exactly the configured platform's home."""
+    _write_default_notify_platform("telegram")
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "no parents"})
+    assert r.status_code == 200
+    subs = _notify_subs(r.json()["task"]["id"])
+    assert [(s["platform"], s["chat_id"], s["thread_id"]) for s in subs] == [("telegram", "1234567", "42")]
+    assert r.json()["home_channel"]["platform"] == "telegram"
+
+def test_create_without_default_notify_platform_adds_no_sub(client, with_home_channels):
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "no key"})
+    assert r.status_code == 200
+    assert _notify_subs(r.json()["task"]["id"]) == []
+    assert "home_channel" not in r.json()
+
+def test_create_with_unhomed_default_notify_platform_adds_no_sub(client, with_home_channels):
+    _write_default_notify_platform("slack")  # token but no home channel
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "slack has no home"})
+    assert r.status_code == 200
+    assert _notify_subs(r.json()["task"]["id"]) == []
+
+def test_create_keeps_only_inherited_sub_when_parent_has_one(client, with_home_channels):
+    """A parent's sub is inherited; the configured home is NOT added on top of it."""
+    from hermes_cli import kanban_db_notify as kbn
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "parent"}).json()["task"]["id"]
+    conn = kbc.connect()
+    try:
+        kbn.add_notify_sub(conn, task_id=parent, platform="discord", chat_id="555")
+    finally:
+        conn.close()
+    _write_default_notify_platform("telegram")
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "child", "parents": [parent]})
+    assert r.status_code == 200
+    subs = _notify_subs(r.json()["task"]["id"])
+    assert [(s["platform"], s["chat_id"]) for s in subs] == [("discord", "555")]
+
 # ---------------------------------------------------------------------------
 # Recovery endpoints (reclaim + reassign) and warnings field
 # ---------------------------------------------------------------------------
