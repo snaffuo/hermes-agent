@@ -185,9 +185,36 @@ def _call_aux(verb: str, task_id: str, *, aux_task: str, system: str, user: str,
         if affinity_token is not None:
             reset_affinity_scope(affinity_token)
     try:
-        return resp.choices[0].message.content or "", ""
+        content = resp.choices[0].message.content or ""
     except Exception:
-        return "", ""
+        content = ""
+    if content.strip():
+        return content, ""
+    cause = _diagnose_empty(resp)
+    log.warning("%s: empty LLM response for %s (%s)", verb, task_id, cause)
+    return "", cause
+
+
+def _diagnose_empty(resp) -> str:
+    """Why a reply came back blank (#81): model, finish_reason, reasoning, token usage. Never raises."""
+    parts = []
+    try:
+        parts.append(f"model={getattr(resp, 'model', None) or 'unknown'}")
+        choice = resp.choices[0]
+        parts.append(f"finish_reason={getattr(choice, 'finish_reason', None)}")
+        reasoning = getattr(choice.message, "reasoning_content", None) or getattr(choice.message, "reasoning", None)
+        if isinstance(reasoning, str) and reasoning:
+            parts.append(f"reasoning_content present ({len(reasoning)} chars) — model may have emitted "
+                         "all text as reasoning with empty content")
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            parts.append(f"completion_tokens={getattr(usage, 'completion_tokens', None)}; "
+                         f"prompt_tokens={getattr(usage, 'prompt_tokens', None)}")
+            if getattr(usage, "completion_tokens", None) == 0:
+                parts.append("provider returned zero completion tokens")
+    except Exception as exc:
+        parts.append(f"diagnostics unavailable ({type(exc).__name__})")
+    return "; ".join(parts)
 
 
 def specify_task(
@@ -238,7 +265,8 @@ def specify_task(
     if parsed is None:
         # Whole reply becomes the body; the user can edit afterward.
         if not raw:
-            return SpecifyOutcome(task_id, False, "LLM returned an empty response")
+            return SpecifyOutcome(task_id, False, f"LLM returned an empty response ({reason})" if reason
+                                  else "LLM returned an empty response")
         new_title, new_body = None, raw
     else:
         new_title, new_body = _title_body(parsed)
