@@ -161,6 +161,48 @@ def test_specify_task_keep_body_rejects_non_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_specify_task_keep_body_refuses_null_body(kanban_home):
+    """#208 guard: a NULL stored body has nothing to preserve — refuse BEFORE
+    specify_triage_task runs, with the message verbatim; the card stays in
+    triage. (Before the guard, keep-body promoted it verbatim and created the
+    empty-body card #208 measured.)"""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="no body", triage=True)  # body stays NULL
+
+    with patch("hermes_cli.kanban_db.specify_triage_task") as promote:
+        outcome = spec.specify_task(tid, author="ace", keep_body=True)
+
+    promote.assert_not_called()
+    assert outcome.ok is False
+    assert outcome.body_preserved is False
+    assert outcome.reason == "keep-body: stored body is empty; nothing to preserve"
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
+    assert task.status == "triage"
+    assert task.body is None
+    assert events == []
+
+
+def test_specify_task_keep_body_refuses_blank_body(kanban_home):
+    """#208 guard, blank half: a whitespace-only body is refused the same way."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="blank body", body=" \n\t ", triage=True)
+
+    with patch("hermes_cli.kanban_db.specify_triage_task") as promote:
+        outcome = spec.specify_task(tid, author="ace", keep_body=True)
+
+    promote.assert_not_called()
+    assert outcome.ok is False
+    assert outcome.reason == "keep-body: stored body is empty; nothing to preserve"
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
+    assert task.status == "triage"
+    assert task.body == " \n\t "
+    assert events == []
+
+
 
 
 
