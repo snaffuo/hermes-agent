@@ -206,13 +206,24 @@ def specify_task(
     never imports or depends on the auxiliary client (AC-6). Passing no body
     means the stored body is only ever read from the raw column inside the DB
     helper's own txn, never re-sourced from the 4000-char-truncated prompt
-    field, so byte-identity is structural (AC-1).
+    field, so byte-identity is structural (AC-1). A NULL or blank stored body is
+    refused before promotion (#208): there is nothing to preserve, and the card
+    stays in triage.
     """
     task, reason = _load_triage_task(task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, reason)
 
     if keep_body:
+        if not _nonblank(task.body):
+            # #208 guard: keep-body promotes the stored body verbatim, so a NULL
+            # or blank body has nothing to preserve — promoting it is exactly what
+            # creates the empty-body card #208 measured. Refuse BEFORE
+            # specify_triage_task runs; the card stays in triage.
+            return SpecifyOutcome(
+                task_id, False,
+                "keep-body: stored body is empty; nothing to preserve",
+            )
         with kbc.connect_closing() as conn:
             ok = kb.specify_triage_task(
                 conn,
