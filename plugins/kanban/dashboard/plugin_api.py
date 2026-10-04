@@ -425,10 +425,13 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn), _value_error_400():
         # CreateTaskBody field names match create_task's keyword parameters.
         task_id = kanban_db.create_task(conn, created_by="dashboard", board=board, **payload.model_dump())
+        home = _subscribe_default_home(conn, task_id)
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(
             task, current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id)
         ) if task else None}
+        if home:
+            body["home_channel"] = home
         # Dispatcher-presence warning so the UI can banner a ready+assigned task that would
         # otherwise sit idle (no gateway / dispatch_in_gateway=false); triage/todo are expected
         # to wait, unassigned tasks can't dispatch anyway. Probe the request's active home: the
@@ -1179,6 +1182,25 @@ def _home_for_platform(platform: str, detail: str) -> dict:
     if not home:
         raise HTTPException(status_code=404, detail=detail)
     return home
+
+
+def _subscribe_default_home(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """A dashboard create has no originating chat: when its parents contributed no notify sub,
+    subscribe the home channel of ``dashboard.kanban.default_notify_platform`` (if set and homed).
+    Returns the subscribed home, else None; never raises, so it can't fail the create."""
+    try:
+        k_cfg = (_load_config_or_empty().get("dashboard") or {}).get("kanban") or {}
+        platform = str(k_cfg.get("default_notify_platform") or "").strip()
+        if not platform or kbn.list_notify_subs(conn, task_id):
+            return None
+        home = next((h for h in _configured_home_channels() if h["platform"] == platform), None)
+        if home:
+            kbn.add_notify_sub(
+                conn, task_id=task_id, platform=platform, chat_id=home["chat_id"],
+                thread_id=home["thread_id"] or None, notifier_profile=_active_profile_name())
+        return home
+    except Exception:
+        return None
 
 
 @router.get("/home-channels")
