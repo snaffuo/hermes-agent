@@ -33,7 +33,7 @@ _SYSTEM_PROMPT = (
 )
 _VERDICTS = {"APPROVE": "approve", "DENY": "deny", "ESCALATE": "escalate"}
 # One extra call finishes hidden reasoning that exhausted 16 tokens (measured 151-408 reasoning tokens on 2026-09-21).
-_RETRY_MAX_TOKENS = 512
+_RETRY_MAX_TOKENS = 2048
 
 
 def _next_comment(text: str, start: int = 0) -> int | None:
