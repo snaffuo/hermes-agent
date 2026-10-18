@@ -2990,7 +2990,14 @@ def _merge_completion_prose_artifacts(
 def _persist_scratch_completion_artifacts(
     conn: sqlite3.Connection, task_id: str, metadata: dict,
 ) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
+    """Copy scratch-workspace completion artifacts before cleanup removes them.
+
+    Declared paths OUTSIDE the scratch workspace are never copied (no cleanup
+    will delete them) — but they are still validated and reported
+    (``metadata["artifacts_not_staged"]``), because a handoff that names files
+    the attachment store never receives reads back as an empty
+    ``kanban_attachments`` list with no other signal (#266).
+    """
     raw_artifacts = metadata.get("artifacts")
     if not isinstance(raw_artifacts, (list, tuple)):
         return
@@ -3009,6 +3016,7 @@ def _persist_scratch_completion_artifacts(
 
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
+    not_staged: list[str] = []
     used_destinations: set[Path] = set()
     changed = False
 
@@ -3023,11 +3031,34 @@ def _persist_scratch_completion_artifacts(
         try:
             resolved_src = src.resolve()
         except OSError:
+            # Unresolvable (symlink loop, unreadable parent): keep the
+            # declaration and report it rather than dropping it silently.
             persisted.append(artifact)
+            not_staged.append(artifact)
             continue
 
         if not resolved_src.is_relative_to(workspace_root):
+            # Outside the scratch workspace: cleanup will not remove it, so
+            # there is nothing to COPY — but the declaration is still checked
+            # and reported. Silently accepting it is what made a 34-path
+            # handoff read back as an empty kanban_attachments list (#266).
+            outside_problem = None
+            if not src.is_file():
+                outside_problem = (
+                    f"declared artifact is unavailable or not a regular file: {artifact} "
+                    f"(and it is outside the scratch workspace, so it cannot be staged "
+                    f"into the task's attachments)"
+                )
+            elif resolved_src.stat().st_size > KANBAN_ATTACHMENT_MAX_BYTES:
+                outside_problem = (
+                    f"declared artifact exceeds the "
+                    f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
+                )
+            if outside_problem:
+                _discard_copies()
+                raise ArtifactPreservationError(outside_problem)
             persisted.append(artifact)
+            not_staged.append(artifact)
             continue
 
         problem = None
@@ -3066,6 +3097,11 @@ def _persist_scratch_completion_artifacts(
         metadata["_staged_artifacts"] = [
             path for path in persisted if path.startswith(str(attachment_dir.resolve()))
         ]
+    if not_staged:
+        # Durable record + the tool result both carry this: a declared path the
+        # attachment store never receives must not be a silent divergence
+        # between the handoff and kanban_attachments (#266).
+        metadata["artifacts_not_staged"] = not_staged
 
 
 def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None:

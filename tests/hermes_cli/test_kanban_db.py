@@ -876,6 +876,53 @@ def test_review_bound_handoff_preserves_declared_artifacts(kanban_home):
     ]
 
 
+def test_review_handoff_reports_artifacts_outside_the_workspace(kanban_home, tmp_path):
+    """#266: a declared path outside the scratch workspace is not copied (no
+    cleanup will delete it) but must NOT pass silently — the run metadata carries
+    it under ``artifacts_not_staged`` so a handoff can never read as
+    artifact-complete while ``kanban_attachments`` returns []."""
+    outside = tmp_path / "rounds" / "REPORT.md"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_text("outside\n", encoding="utf-8")
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="outside artifact")
+        task = kb.get_task(conn, t)
+        ws = kbw.resolve_workspace(task)
+        kbw.set_workspace_path(conn, t, ws)
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        assert kb.request_review(
+            conn, t, summary="handoff", metadata={"artifacts": [str(outside)]},
+            expected_run_id=run_id)
+        run = kb.latest_run(conn, t)
+        attachments = kb.list_attachments(conn, t)
+        handoff = [e for e in kb.list_events(conn, t) if e.kind == "review_requested"][-1]
+    assert attachments == [], "an outside path is referenced, not copied"
+    assert run.metadata["artifacts"] == [str(outside)]
+    assert run.metadata["artifacts_not_staged"] == [str(outside)]
+    assert handoff.payload["artifacts"] == [str(outside)]
+
+
+def test_review_handoff_rejects_missing_artifact_outside_the_workspace(kanban_home, tmp_path):
+    """#266: existence is validated for every declared path, not only the
+    in-workspace ones — a typo'd path outside the workspace used to be accepted
+    with zero attachments and ``ok: true``."""
+    missing = tmp_path / "rounds" / "nope.txt"
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="missing outside artifact")
+        task = kb.get_task(conn, t)
+        ws = kbw.resolve_workspace(task)
+        kbw.set_workspace_path(conn, t, ws)
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        with pytest.raises(kb.ArtifactPreservationError):
+            kb.request_review(
+                conn, t, summary="handoff", metadata={"artifacts": [str(missing)]},
+                expected_run_id=run_id)
+        assert kb.get_task(conn, t).status == "running", "the transition rolled back"
+        assert kb.list_attachments(conn, t) == []
+
+
 def test_request_review_rollback_discards_staged_copies(kanban_home):
     """A failure after staging rolls the txn back; the copied file must go
     too, or the retry stages ``evidence_1.json`` next to an orphan."""
