@@ -1009,6 +1009,8 @@ def _patch_specifier_response(monkeypatch, *, content, model="test-model"):
     return fake_call
 
 def test_specify_happy_path(client, monkeypatch):
+    """The rewrite is now opt-in (#231): the endpoint must be told
+    ``rewrite: true`` before the model's body may replace the stored one."""
     import json as jsonlib
 
     # Create a triage task.
@@ -1027,19 +1029,80 @@ def test_specify_happy_path(client, monkeypatch):
 
     r = client.post(
         f"/api/plugins/kanban/tasks/{t['id']}/specify",
-        json={"author": "ui-tester"},
+        json={"author": "ui-tester", "rewrite": True},
     )
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is True
     assert body["task_id"] == t["id"]
     assert body["new_title"] == "Polished"
+    assert body["body_preserved"] is False
 
     # Task should have moved off the triage column.
     detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["task"]
     assert detail["status"] in {"todo", "ready"}
     assert detail["title"] == "Polished"
     assert "**Goal**" in (detail["body"] or "")
+
+
+def test_specify_endpoint_defaults_to_body_preservation(client, monkeypatch):
+    """#231: the endpoint without ``rewrite`` promotes the stored body verbatim
+    and never reaches the auxiliary client."""
+    from unittest.mock import MagicMock
+
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "already specified", "triage": True,
+              "body": "**Goal**\nverbatim body.\n"},
+    ).json()["task"]
+    assert t["status"] == "triage"
+
+    boom = MagicMock(side_effect=AssertionError("aux client must not be called"))
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", boom)
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/specify",
+        json={"author": "ui-tester"},
+    )
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["ok"] is True
+    assert payload["body_preserved"] is True
+    assert payload["new_title"] is None
+    boom.assert_not_called()
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["task"]
+    assert detail["status"] in {"todo", "ready"}
+    assert detail["body"] == "**Goal**\nverbatim body.\n"
+
+
+def test_specify_endpoint_refuses_empty_body_without_rewrite(client, monkeypatch):
+    """#208 + #231: an empty stored body has nothing to preserve, so the
+    default refuses (200 with ok=false, reason names the escape hatch) and the
+    card stays in triage. The refusal is loud, not a silent LLM fill-in."""
+    from unittest.mock import MagicMock
+
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "no body", "triage": True},
+    ).json()["task"]
+
+    boom = MagicMock(side_effect=AssertionError("aux client must not be called"))
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", boom)
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/specify",
+        json={"author": "ui-tester"},
+    )
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["ok"] is False
+    assert payload["body_preserved"] is False
+    assert "--rewrite" in payload["reason"]
+    boom.assert_not_called()
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["task"]
+    assert detail["status"] == "triage"
 
 # ---------------------------------------------------------------------------
 # Aux-LLM endpoints under multiplexed hosting — profile secret scope (#123372)
@@ -1084,8 +1147,9 @@ def test_specify_resolves_each_profiles_key_under_multiplex(kanban_home, tmp_pat
         params = {"profile": profile} if profile else None
         task = client.post("/api/plugins/kanban/tasks", params=params,
                            json={"title": "one-liner", "triage": True}).json()["task"]
+        # #231: the endpoint only reaches the model when asked to rewrite.
         return client.post(f"/api/plugins/kanban/tasks/{task['id']}/specify", params=params,
-                           json={"author": "ui-tester"}).json()
+                           json={"author": "ui-tester", "rewrite": True}).json()
 
     was_active, snapshot = ss.is_multiplex_active(), launch_profile_policy._snapshot
     ss.set_multiplex_active(True)
