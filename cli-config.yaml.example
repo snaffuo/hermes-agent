@@ -401,6 +401,7 @@ model:
 # Disable this only when every review is performed manually from the dashboard.
 kanban:
   review_dispatch: true
+  # notify_artifact_uploads: true   # Upload a card's declared artifacts as native files (default: true; false keeps the text ping only)
 
 # =============================================================================
 # Terminal Tool Configuration
