@@ -1366,15 +1366,20 @@ def _retitled_suffix(outcome) -> str:
 
 
 def _cmd_specify(args: argparse.Namespace) -> int:
-    """Spec a triage task (or all) via the auxiliary LLM, promote to todo.
+    """Spec a triage task (or all), promote to todo.
 
-    ``--keep-body`` skips the LLM pass and promotes the card verbatim
-    (#110339 body-preserving triage exit)."""
+    Body preservation is the DEFAULT (#231): with no flags the stored body is
+    promoted verbatim and the auxiliary LLM is never called. ``--rewrite`` opts
+    in to the LLM rewrite; ``--keep-body`` is the explicit spelling of the
+    (now default) preserving exit and conflicts with ``--rewrite``."""
     from hermes_cli import kanban_specify as spec
 
-    keep_body = bool(getattr(args, "keep_body", False))
+    # #231: absent flag -> None ("caller did not ask"), not False ("caller asked
+    # for the rewrite"). specify_task reads the difference.
+    keep_body = True if getattr(args, "keep_body", False) else None
+    rewrite = bool(getattr(args, "rewrite", False))
     def _run_one(task_id: str, *, author: str | None = None):
-        return spec.specify_task(task_id, author=author, keep_body=keep_body)
+        return spec.specify_task(task_id, author=author, keep_body=keep_body, rewrite=rewrite)
 
     return _run_triage_sweep(args, "specify", spec, _run_one, "specified",
                              ("task_id", "ok", "reason", "new_title", "body_preserved"),
