@@ -405,8 +405,10 @@ _SPECS = [
         _arg("--user-id-alt"),
         _arg("--chat-type", choices=("dm", "group", "channel", "thread"),
              help="Originating source chat_type, recorded so the active-wake delivery "
-                  "modes resolve the operator's real session. Omit to leave an "
-                  "existing sub unchanged (new subs default to 'dm')."),
+                  "modes resolve the operator's real session. An explicit value "
+                  "always wins; when omitted, a new sub derives its type from the "
+                  "chat id shape (negative id -> 'group', otherwise 'dm'), and an "
+                  "existing sub is left unchanged."),
         _arg("--parent-chat-id",
              help="Parent channel ID for a thread or forum post, used for multiplex profile routing."),
         _arg("--guild-id",

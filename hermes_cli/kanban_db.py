@@ -1361,6 +1361,25 @@ def _missing_task_ids(conn: sqlite3.Connection, ids: Iterable[str]) -> list[str]
     return [p for p in ids if p not in present]
 
 
+# #272 follow-up: the notify-sub chat_type derivation as a SQL expression, so the
+# single-statement inheritance INSERT can resolve it in-place. This is the same
+# rule as kanban_db_notify.default_chat_type_for_chat_id — NOT an independent
+# reimplementation: that module imports kanban_db (cycle), so its Python helper
+# cannot be called here, and
+# tests/hermes_cli/test_kanban_notify_chat_type_default.py::
+# test_sql_chat_type_rule_agrees_with_python_helper pins the two together over a
+# table of chat-id shapes (any divergence fails that test).
+# A negative chat id cannot be a DM on a platform using Telegram's sign
+# convention, so it derives 'group'; anything else keeps the historical 'dm'.
+_INHERITED_CHAT_TYPE_SQL = (
+    "CASE WHEN chat_type IS NOT NULL AND chat_type <> '' THEN chat_type "
+    "WHEN SUBSTR(TRIM(chat_id), 1, 1) = '-' "
+    "AND LENGTH(TRIM(chat_id)) > 1 "
+    "AND TRIM(SUBSTR(TRIM(chat_id), 2), '0123456789') = '' THEN 'group' "
+    "ELSE 'dm' END"
+)
+
+
 def _inherit_notify_subs(
     conn: sqlite3.Connection, child_id: str, parents: Iterable[str], *,
     created_at: Optional[int] = None,
@@ -1374,6 +1393,16 @@ def _inherit_notify_subs(
 
     Omitting columns here silently degrades routing: a DM-originated child completion falls back to
     chat_type='group' and wakes a fresh group-scoped session instead of the originating DM (issue #73030).
+
+    ``chat_type`` is inherited as-is when the parent recorded one. A parent row
+    from a pre-``chat_type`` database carries NULL (or ''), and the historical
+    ``COALESCE(chat_type, 'dm')`` stamped the impossible pairing
+    ``chat_type='dm'`` on a negative (group) chat id — the #272 defect, one
+    function over. NULL/'' is instead resolved from the chat id shape by
+    :data:`_INHERITED_CHAT_TYPE_SQL`, the SQL expression of the same rule as
+    ``kanban_db_notify.default_chat_type_for_chat_id`` (that module imports this
+    one, so the Python helper is not importable here; the two expressions are
+    held together by a parity test).
     """
     parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
@@ -1390,7 +1419,7 @@ def _inherit_notify_subs(
              chat_type, notifier_profile, delivery_mode, delivery_metadata,
              created_at, last_event_id)
         SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
-               COALESCE(chat_type, 'dm'), notifier_profile,
+               {_INHERITED_CHAT_TYPE_SQL}, notifier_profile,
                COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
