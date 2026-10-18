@@ -1259,7 +1259,8 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
         return 0
     for s in subs:
         thr = f":{s['thread_id']}" if s.get("thread_id") else ""
-        dmode, ctype = s.get("delivery_mode") or "notify", s.get("chat_type") or "dm"
+        dmode = s.get("delivery_mode") or "notify"
+        ctype = s.get("chat_type") or kbn.default_chat_type_for_chat_id(s.get("chat_id"))
         extras = "".join((
             f"  owner={s['notifier_profile']}" if s.get("notifier_profile") else "",
             "" if ctype == "dm" else f"  chat_type={ctype}",
