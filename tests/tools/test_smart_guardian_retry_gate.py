@@ -35,20 +35,26 @@ class _Resp:
 
 @pytest.fixture
 def smart_gate_session(monkeypatch):
-    """A gateway session in ``smart`` mode with every command flagged as dangerous."""
+    """A gateway session in ``smart`` mode with every command flagged as dangerous.
+
+    The ambient markers that clear the presence trio (single-query ``-q``, cron) are
+    deleted too: ``hermes chat -q`` exports ``HERMES_INTERACTIVE=1``, and a ``-q`` or
+    cron marker left in the environment would overrule the gateway marker this fixture
+    sets, so the gate would take the unattended branch (``approvals.single_query_mode``,
+    default deny) and never reach the guardian.
+    """
     monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
-    for var in ("HERMES_INTERACTIVE", "HERMES_CRON_SESSION", "HERMES_EXEC_ASK"):
+    for var in ("HERMES_INTERACTIVE", "HERMES_CRON_SESSION", "HERMES_EXEC_ASK",
+                "HERMES_SINGLE_QUERY_SESSION"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
     flagged = lambda command: (True, "gate-retry-danger", f"risk:{command}")  # noqa: E731
     monkeypatch.setattr(A, "detect_dangerous_command", flagged)
     monkeypatch.setattr(approval_detection, "detect_dangerous_command", flagged)
-    monkeypatch.setattr(
-        "tools.tirith_security.check_command_security",
-        lambda _command: {"action": "allow", "findings": [], "summary": ""},
-        raising=False,
-    )
+    # (The old `tools.tirith_security.check_command_security` seam is gone: upstream
+    # 68dd992769 deleted the bundled scanner and folded its detections into
+    # `approval_detection.detect_dangerous_command`, already stubbed just above.)
 
     token = approval_context.set_current_session_key(SESSION_KEY)
     A._reset_denials(SESSION_KEY)
