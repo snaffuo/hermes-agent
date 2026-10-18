@@ -345,6 +345,23 @@ def _ok_landed(kb, conn, tid: str, default_status: str, **extra: Any) -> str:
                status=landed.status if landed else default_status, **extra)
 
 
+def _not_staged_extras(kb, conn, tid: str) -> dict:
+    """Declared artifacts the handoff could not store.
+
+    ``_persist_scratch_completion_artifacts`` records these on the run's
+    metadata (paths outside the scratch workspace: nothing is copied, so no
+    attachment row exists). Surfacing them in the tool result keeps a handoff
+    from reading as artifact-complete while ``kanban_attachments`` returns []
+    — the silent divergence measured on t_44257781 / #266.
+    """
+    run = kb.latest_run(conn, tid)
+    meta = getattr(run, "metadata", None) if run is not None else None
+    raw = meta.get("artifacts_not_staged") if isinstance(meta, dict) else None
+    if isinstance(raw, (list, tuple)) and raw:
+        return {"artifacts_not_staged": [str(p) for p in raw]}
+    return {}
+
+
 def _redact(value: Any) -> str:
     return redact_sensitive_text(str(value), force=True)
 
@@ -805,7 +822,8 @@ def _handle_complete(args: dict, **kw) -> str:
         return _ok(task_id=tid, run_id=run.id if run else None,
                    attachments=[
                        _fields(a, _ATTACHMENT_FIELDS)
-                       for a in kb.list_attachments(conn, tid)])
+                       for a in kb.list_attachments(conn, tid)],
+                   **_not_staged_extras(kb, conn, tid))
 
 
 @_kanban_handler("kanban_block")
@@ -913,7 +931,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 f"kanban_request_review with the same handoff.")
         _check(ok, f"could not request review for {tid}: "
                    f"{fail_reason or 'unknown id or not in running/ready'}")
-        return _ok_landed(kb, conn, tid, "review")
+        return _ok_landed(kb, conn, tid, "review", **_not_staged_extras(kb, conn, tid))
 
 
 @_kanban_handler("kanban_request_changes")
