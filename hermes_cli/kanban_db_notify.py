@@ -64,6 +64,28 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     return {str(key): value for key, value in data.items() if isinstance(value, _SCALAR_TYPES)}
 
 
+def default_chat_type_for_chat_id(chat_id: Any) -> str:
+    """``chat_type`` for a NEW subscription that supplied none (#272).
+
+    Telegram DM chat ids are positive user ids; groups, supergroups and
+    channels are negative. Defaulting every such subscription to ``'dm'``
+    stamped an internally impossible pairing (``chat_type='dm'`` on a negative
+    chat id) onto 86 live rows, and the recorded ``chat_type`` is replayed into
+    ``build_session_key()`` by the active-wake path — so the woken turn keyed a
+    DM session instead of the originating group topic.
+
+    Derive from the chat id shape: a negative integer chat id cannot be a DM on
+    any platform using Telegram's sign convention, so it defaults to
+    ``'group'``; everything else keeps the historical ``'dm'`` default (a
+    positive chat id carrying a ``thread_id`` is a Telegram DM topic, not a
+    group). An explicit ``chat_type`` still wins over this.
+    """
+    text = str(chat_id).strip()
+    if text.startswith("-") and text[1:].isdigit():
+        return "group"
+    return "dm"
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,
@@ -84,7 +106,10 @@ def add_notify_sub(
     ``user_id_alt`` (Signal UUID, Feishu union_id, ...) and ``chat_type`` are
     replayed on active wake: ``build_session_key`` prefers the alt id, so
     omitting it would key the wake into a different session. ``None`` keeps an
-    existing row's value. ``delivery_mode``: ``None`` leaves an existing row
+    existing row's value, and a NEW row without one derives it from the chat id
+    shape (:func:`default_chat_type_for_chat_id`) rather than assuming ``'dm'``
+    — a negative (group) chat id defaulted to ``'dm'`` never woke its own
+    session (#272). ``delivery_mode``: ``None`` leaves an existing row
     untouched, an explicit valid value is last-write-wins, unknown falls back
     to ``"notify"``. ``delivery_metadata`` merges supplied routing anchors
     into an existing row so re-subscribing never discards them. New subs start
@@ -117,7 +142,8 @@ def add_notify_sub(
                     COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
             """,
             (
-                *key, user_id, user_id_alt, chat_type or "dm", notifier_profile,
+                *key, user_id, user_id_alt,
+                chat_type or default_chat_type_for_chat_id(chat_id), notifier_profile,
                 insert_mode, metadata_json, int(time.time()), task_id,
             ),
         )
