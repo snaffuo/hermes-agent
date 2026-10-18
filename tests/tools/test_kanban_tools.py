@@ -297,6 +297,30 @@ def test_request_review_accepts_installed_profile(monkeypatch, worker_env, tmp_p
         assert (task.status, task.assignee) == ("review", "verifier")
 
 
+def test_request_review_result_reports_unstaged_artifacts(worker_env, tmp_path):
+    """#266: the tool result names every declared path the attachment store did
+    not receive, so ``ok: true`` is never the only signal a handoff carries."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_workspace as kbw
+    from tools import kanban_tools as kt
+
+    outside = tmp_path / "rounds" / "e1.txt"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_text("evidence\n", encoding="utf-8")
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        kbw.set_workspace_path(conn, worker_env, kbw.resolve_workspace(task))
+
+    out = json.loads(kt._handle_request_review(
+        {"summary": "Ready for review.", "artifacts": [str(outside)]}))
+
+    assert out["ok"] is True
+    assert out["artifacts_not_staged"] == [str(outside)]
+    with kbc.connect() as conn:
+        assert kb.list_attachments(conn, worker_env) == []
+
+
 def test_unbound_worker_cannot_mutate_card(monkeypatch, worker_env):
     """A dispatcher-spawned worker that cannot resolve its run id must be refused
     on every run-lifecycle mutation. ``expected_run_id=None`` would silently skip
