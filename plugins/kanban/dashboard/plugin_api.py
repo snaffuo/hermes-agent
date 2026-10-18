@@ -120,11 +120,16 @@ def _require(getter: Callable, conn: sqlite3.Connection, ident, label: str):
     return obj
 
 
-def _run_aux(board: Optional[str], module: str, fn: str, task_id: str, author: Optional[str]) -> Any:
+def _run_aux(board: Optional[str], module: str, fn: str, task_id: str, author: Optional[str],
+             extra: Optional[dict] = None) -> Any:
     """Run a slow auxiliary-LLM task helper (``hermes_cli.<module>.<fn>``) with the board pinned;
-    the module is imported lazily so a missing aux client can't break plugin load."""
+    the module is imported lazily so a missing aux client can't break plugin load. ``extra`` carries
+    helper-specific keywords (e.g. ``{"rewrite": True}`` for the #231 opt-in) — this generic runner
+    never invents them, so an endpoint that grows a knob passes it explicitly."""
+    kwargs = dict(extra or {})
     def _run():
-        return getattr(importlib.import_module(f"hermes_cli.{module}"), fn)(task_id, author=(author or None))
+        return getattr(importlib.import_module(f"hermes_cli.{module}"), fn)(
+            task_id, author=(author or None), **kwargs)
     return _with_board_pinned(board, _run)
 
 
@@ -1016,18 +1021,25 @@ def reclaim_task_endpoint(task_id: str, payload: ReclaimBody, board: Optional[st
 
 
 class SpecifyBody(BaseModel):
-    """Only the author is configurable; model + prompt come from
-    ``auxiliary.triage_specifier`` in config.yaml, same as the CLI."""
+    """The author and the #231 rewrite opt-in are the only knobs; model + prompt come from
+    ``auxiliary.triage_specifier`` in config.yaml, same as the CLI.
+
+    ``rewrite`` defaults to False — the endpoint promotes the stored body verbatim and never
+    calls the model unless the caller explicitly asks for the replacement."""
 
     author: Optional[str] = None
+    rewrite: bool = False
 
 
 @router.post("/tasks/{task_id}/specify")
 def specify_task_endpoint(task_id: str, payload: SpecifyBody, board: Optional[str] = Query(None)):
-    """Flesh out a triage task via the auxiliary LLM (``hermes kanban specify``). Non-OK is NOT
+    """Promote a triage task (``hermes kanban specify``): body preserved verbatim unless
+    ``rewrite=true`` opts in to the auxiliary-LLM replacement (#231). Non-OK is NOT
     an HTTP error — the UI renders the reason inline. Sync ``def`` → runs in the threadpool."""
-    outcome = _run_aux(board, "kanban_specify", "specify_task", task_id, payload.author)
-    return {"ok": bool(outcome.ok), "task_id": outcome.task_id, "reason": outcome.reason, "new_title": outcome.new_title}
+    outcome = _run_aux(board, "kanban_specify", "specify_task", task_id, payload.author,
+                       extra={"rewrite": bool(payload.rewrite)})
+    return {"ok": bool(outcome.ok), "task_id": outcome.task_id, "reason": outcome.reason,
+            "new_title": outcome.new_title, "body_preserved": bool(outcome.body_preserved)}
 
 
 class ReassignBody(BaseModel):

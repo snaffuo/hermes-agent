@@ -70,6 +70,8 @@ def _patch_aux_client(content: str, *, model: str = "test-model"):
 # ---------------------------------------------------------------------------
 
 def test_specify_task_happy_path(kanban_home):
+    """The LLM path is opt-in since #231: rewrite=True is what lets the reply
+    become the card's body (here the card starts with no body at all)."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="rough", triage=True)
 
@@ -79,7 +81,7 @@ def test_specify_task_happy_path(kanban_home):
     })
     p, _ = _patch_aux_client(content)
     with p:
-        outcome = spec.specify_task(tid, author="ace")
+        outcome = spec.specify_task(tid, author="ace", rewrite=True)
 
     assert outcome.ok is True
     assert outcome.task_id == tid
@@ -175,7 +177,10 @@ def test_specify_task_keep_body_refuses_null_body(kanban_home):
     promote.assert_not_called()
     assert outcome.ok is False
     assert outcome.body_preserved is False
-    assert outcome.reason == "keep-body: stored body is empty; nothing to preserve"
+    assert outcome.reason == (
+        "specify: stored body is empty; nothing to preserve "
+        "(pass --rewrite to have the specifier write one)"
+    )
     with kbc.connect() as conn:
         task = kb.get_task(conn, tid)
         events = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
@@ -194,7 +199,10 @@ def test_specify_task_keep_body_refuses_blank_body(kanban_home):
 
     promote.assert_not_called()
     assert outcome.ok is False
-    assert outcome.reason == "keep-body: stored body is empty; nothing to preserve"
+    assert outcome.reason == (
+        "specify: stored body is empty; nothing to preserve "
+        "(pass --rewrite to have the specifier write one)"
+    )
     with kbc.connect() as conn:
         task = kb.get_task(conn, tid)
         events = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
@@ -224,17 +232,21 @@ def _run_cli(*argv: str) -> int:
 
 
 def test_cli_specify_tenant_filter(kanban_home, capsys):
+    """The --all sweep honours --tenant. Since #231 the sweep takes the
+    body-preserving default, so the inside task carries a body and the aux
+    client is patched to RAISE — the LLM must never be reached (the raise is
+    the control that the default really is preserve-only)."""
     with kbc.connect() as conn:
         outside = kb.create_task(conn, title="outside", triage=True)
         inside = kb.create_task(
-            conn, title="inside", triage=True, tenant="proj-a",
+            conn, title="inside", body="**Goal**\ntenant body.", triage=True, tenant="proj-a",
         )
 
-    content = jsonlib.dumps({"title": "spec", "body": "body"})
-    p, _ = _patch_aux_client(content)
-    with p:
+    boom = MagicMock(side_effect=AssertionError("aux client must not be called"))
+    with patch("agent.auxiliary_client.call_llm", boom):
         rc = _run_cli("specify", "--all", "--tenant", "proj-a", "--json")
     assert rc == 0
+    boom.assert_not_called()
     lines = [
         jsonlib.loads(l)
         for l in capsys.readouterr().out.strip().splitlines()
@@ -242,12 +254,15 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
     ]
     ids = {row["task_id"] for row in lines}
     assert ids == {inside}
+    assert [row["body_preserved"] for row in lines] == [True]
 
     # The outside task stays in triage.
     with kbc.connect() as conn:
         assert kb.get_task(conn, outside).status == "triage"
-        # The inside task was promoted.
-        assert kb.get_task(conn, inside).status in {"todo", "ready"}
+        # The inside task was promoted, body byte-identical.
+        promoted = kb.get_task(conn, inside)
+        assert promoted.status in {"todo", "ready"}
+        assert promoted.body == "**Goal**\ntenant body."
 
 
 def test_cli_keep_body_end_to_end(kanban_home, capsys):
@@ -282,8 +297,8 @@ def test_cli_keep_body_end_to_end(kanban_home, capsys):
 
 
 def test_cli_keep_body_flag_is_specify_only(kanban_home):
-    """AC-3 (parser): --keep-body is specify-only — _triage_sweep_args is
-    shared with decompose, which must NOT gain the flag."""
+    """AC-3 (parser): --keep-body and --rewrite are specify-only —
+    _triage_sweep_args is shared with decompose, which must NOT gain either."""
     root = argparse.ArgumentParser()
     subp = root.add_subparsers(dest="cmd")
     kanban_cli.build_parser(subp)
@@ -292,20 +307,49 @@ def test_cli_keep_body_flag_is_specify_only(kanban_home):
     # decompose never received the flag: argparse must reject it there.
     with pytest.raises(SystemExit):
         root.parse_args(["kanban", "decompose", "t_x", "--keep-body"])
-    # specify without the flag defaults it off.
+    # #231: the rewriting exit is its own explicit opt-in.
+    ns3 = root.parse_args(["kanban", "specify", "t_x", "--rewrite"])
+    assert ns3.rewrite is True
+    assert ns3.keep_body is False
+    with pytest.raises(SystemExit):
+        root.parse_args(["kanban", "decompose", "t_x", "--rewrite"])
+    # specify with neither flag: both off (preservation is the default).
     ns2 = root.parse_args(["kanban", "specify", "t_x"])
     assert ns2.keep_body is False
+    assert ns2.rewrite is False
 
 
-def test_cli_llm_path_still_condenses(kanban_home, capsys):
-    """AC-3: specify WITHOUT --keep-body still runs the LLM pass and replaces
-    the body (existing condensing behaviour preserved)."""
+def test_cli_specify_default_preserves_body(kanban_home, capsys):
+    """#231 AC: `specify <id>` with NO flags preserves the body byte-for-byte and
+    never calls the aux client — the default used to rewrite it instead."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="default", body=KEEP_BODY, triage=True)
+
+    boom = MagicMock(side_effect=AssertionError("aux client must not be called"))
+    with patch("agent.auxiliary_client.call_llm", boom):
+        rc = _run_cli("specify", tid, "--json")
+    assert rc == 0
+    boom.assert_not_called()
+    row = jsonlib.loads(capsys.readouterr().out.strip())
+    assert row == {"task_id": tid, "ok": True, "reason": "specified (verbatim)",
+                   "new_title": None, "body_preserved": True}
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert len(KEEP_BODY) > 4000
+    assert task.body == KEEP_BODY
+    assert task.title == "default"
+
+
+def test_cli_rewrite_flag_condenses(kanban_home, capsys):
+    """AC-3: the LLM pass (and its wholesale body replacement) now requires the
+    explicit --rewrite flag."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="rough", body=KEEP_BODY, triage=True)
     content = jsonlib.dumps({"title": "Condensed", "body": "**Goal**\nshort."})
     p, mock_fn = _patch_aux_client(content)
     with p:
-        rc = _run_cli("specify", tid, "--json")
+        rc = _run_cli("specify", tid, "--rewrite", "--json")
     assert rc == 0
     row = jsonlib.loads(capsys.readouterr().out.strip())
     assert row["ok"] is True
@@ -316,6 +360,102 @@ def test_cli_llm_path_still_condenses(kanban_home, capsys):
     assert task.body == "**Goal**\nshort."
     events = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
     assert events[-1].payload == {"changed_fields": ["title", "body"]}
+
+
+def test_specify_task_default_is_preserve_only(kanban_home):
+    """Module level: no flags -> preserving exit, LLM untouched."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="mod", body="**Goal**\nkept.\n", triage=True)
+    boom = MagicMock(side_effect=AssertionError("aux client must not be called"))
+    with patch("agent.auxiliary_client.call_llm", boom):
+        outcome = spec.specify_task(tid, author="ace")
+    assert outcome.ok is True
+    assert outcome.body_preserved is True
+    boom.assert_not_called()
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).body == "**Goal**\nkept.\n"
+
+
+def test_specify_task_rewrite_flag_replaces_body(kanban_home):
+    """Module level: rewrite=True is the opt-in that lets the reply replace."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="mod", body="old body", triage=True)
+    content = jsonlib.dumps({"title": "New title", "body": "new body"})
+    p, mock_fn = _patch_aux_client(content)
+    with p:
+        outcome = spec.specify_task(tid, author="ace", rewrite=True)
+    assert outcome.ok is True
+    assert outcome.body_preserved is False
+    assert mock_fn.called
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.body == "new body"
+    assert task.title == "New title"
+
+
+def test_specify_task_legacy_keep_body_false_still_rewrites(kanban_home):
+    """Back-compat: an out-of-tree caller passing keep_body=False keeps the
+    pre-#231 meaning (run the LLM pass) — only the DEFAULT flipped."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="mod", body="old body", triage=True)
+    content = jsonlib.dumps({"title": "T", "body": "legacy rewrite"})
+    p, mock_fn = _patch_aux_client(content)
+    with p:
+        outcome = spec.specify_task(tid, author="ace", keep_body=False)
+    assert outcome.ok is True
+    assert outcome.body_preserved is False
+    assert mock_fn.called
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).body == "legacy rewrite"
+
+
+def test_specify_task_rewrite_conflicts_with_keep_body(kanban_home):
+    """--rewrite replaces, --keep-body preserves: the contradiction is refused
+    loudly (card stays in triage, LLM never called), never resolved by
+    precedence."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="both", body="**Goal**\nkept.\n", triage=True)
+    boom = MagicMock(side_effect=AssertionError("aux client must not be called"))
+    with patch("agent.auxiliary_client.call_llm", boom):
+        outcome = spec.specify_task(tid, author="ace", keep_body=True, rewrite=True)
+    assert outcome.ok is False
+    assert "conflicting request" in outcome.reason
+    boom.assert_not_called()
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "specified"]
+    assert task.status == "triage"
+    assert task.body == "**Goal**\nkept.\n"
+    assert events == []
+
+
+def test_cli_rewrite_conflicts_with_keep_body_exits_nonzero(kanban_home, capsys):
+    """CLI half of the contradiction: exit 1, card untouched, reason on stderr."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="both", body="**Goal**\nkept.\n", triage=True)
+    boom = MagicMock(side_effect=AssertionError("aux client must not be called"))
+    with patch("agent.auxiliary_client.call_llm", boom):
+        rc = _run_cli("specify", tid, "--rewrite", "--keep-body")
+    assert rc == 1
+    boom.assert_not_called()
+    assert "conflicting request" in capsys.readouterr().err
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_cli_specify_empty_body_refusal_names_rewrite(kanban_home, capsys):
+    """#208 guard, now on the default path: a NULL body is refused with an
+    actionable reason and the card stays in triage — no silent LLM fill-in."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="no body", triage=True)
+    boom = MagicMock(side_effect=AssertionError("aux client must not be called"))
+    with patch("agent.auxiliary_client.call_llm", boom):
+        rc = _run_cli("specify", tid)
+    assert rc == 1
+    boom.assert_not_called()
+    assert "--rewrite" in capsys.readouterr().err
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
 
 
 

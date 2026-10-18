@@ -1,10 +1,12 @@
 """Kanban triage specifier — flesh out a one-liner into a real spec.
 
-``hermes kanban specify [task_id | --all]`` asks the auxiliary LLM for a
-tightened title + concrete body for a Triage task, then flips it
-``triage -> todo`` via ``kanban_db.specify_triage_task``. With ``--keep-body``
-the LLM pass is skipped and the card is promoted verbatim — the body-
-preserving triage exit for already-spec-complete bodies (#110339).
+``hermes kanban specify [task_id | --all]`` flips a Triage task
+``triage -> todo`` via ``kanban_db.specify_triage_task``. Body preservation is
+the DEFAULT (#231): with no flags the stored body is promoted byte-for-byte and
+the auxiliary LLM is never called — the body-preserving triage exit originally
+shipped as ``--keep-body`` (#110339). The rewriting exit is now opt-in
+(``--rewrite`` / ``rewrite=True``): it asks the auxiliary LLM for a tightened
+title + concrete body and REPLACES the stored title/body with the reply.
 
 Mirrors ``hermes_cli/goals.py``: same aux-client pattern, same "empty config
 => skip, don't crash" tolerance. One shot, no retry loop. JSON mode is not
@@ -195,34 +197,59 @@ def specify_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
-    keep_body: bool = False,
+    keep_body: Optional[bool] = None,
+    rewrite: bool = False,
 ) -> SpecifyOutcome:
     """Specify one triage task and promote it to ``todo``. Expected failures
     (not in triage, no aux client, API error, malformed reply) surface as
     ``ok=False`` so an ``--all`` sweep continues.
 
-    ``keep_body=True`` is the body-preserving triage exit (#110339): the LLM
-    pass is skipped entirely — the branch sits BEFORE ``_call_aux`` so the exit
-    never imports or depends on the auxiliary client (AC-6). Passing no body
-    means the stored body is only ever read from the raw column inside the DB
-    helper's own txn, never re-sourced from the 4000-char-truncated prompt
-    field, so byte-identity is structural (AC-1). A NULL or blank stored body is
-    refused before promotion (#208): there is nothing to preserve, and the card
-    stays in triage.
+    Body preservation is the DEFAULT (#231): the stored body is promoted
+    byte-for-byte and the LLM pass is skipped entirely — the branch sits BEFORE
+    ``_call_aux`` so the default exit never imports or depends on the auxiliary
+    client (AC-6). Passing no body means the stored body is only ever read from
+    the raw column inside the DB helper's own txn, never re-sourced from the
+    4000-char-truncated prompt field, so byte-identity is structural (AC-1).
+
+    The rewriting exit is opt-in and explicit:
+      * ``rewrite=True`` (CLI ``--rewrite``) runs the aux LLM and lets the
+        reply REPLACE the stored title/body;
+      * ``keep_body=False`` is the legacy spelling of that same request — it
+        meant "run the LLM pass" before #231 and still does, so out-of-tree
+        callers keep their meaning;
+      * ``keep_body=True`` alongside ``rewrite=True`` is a contradiction and is
+        refused rather than resolved by precedence — one of the two would
+        silently lose otherwise.
+
+    A NULL or blank stored body is refused before promotion (#208): the
+    preserving exit has nothing to preserve, and the card stays in triage with
+    a reason that names the ``--rewrite`` escape hatch.
     """
     task, reason = _load_triage_task(task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, reason)
 
-    if keep_body:
+    if rewrite and keep_body:
+        # #231: two explicit, opposite requests. Never resolve by precedence.
+        return SpecifyOutcome(
+            task_id, False,
+            "conflicting request: --rewrite replaces the stored body, --keep-body preserves it",
+        )
+    # #231: preservation is the default, so an explicit keep_body=False is the
+    # only other way to ask for the rewrite (the pre-#231 spelling).
+    rewrite = bool(rewrite) or keep_body is False
+
+    if not rewrite:
         if not _nonblank(task.body):
-            # #208 guard: keep-body promotes the stored body verbatim, so a NULL
-            # or blank body has nothing to preserve — promoting it is exactly what
-            # creates the empty-body card #208 measured. Refuse BEFORE
-            # specify_triage_task runs; the card stays in triage.
+            # #208 guard: the preserving exit promotes the stored body verbatim,
+            # so a NULL or blank body has nothing to preserve — promoting it is
+            # exactly what creates the empty-body card #208 measured. Refuse
+            # BEFORE specify_triage_task runs; the card stays in triage. The
+            # reason names the escape hatch so the refusal is actionable.
             return SpecifyOutcome(
                 task_id, False,
-                "keep-body: stored body is empty; nothing to preserve",
+                "specify: stored body is empty; nothing to preserve "
+                "(pass --rewrite to have the specifier write one)",
             )
         with kbc.connect_closing() as conn:
             ok = kb.specify_triage_task(
