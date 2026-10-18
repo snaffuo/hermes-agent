@@ -796,3 +796,113 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+# ---------------------------------------------------------------------------
+# SPEC-R-20261018-B §1 — kanban.notify_artifact_uploads.
+#
+# The switch is read once at notifier start (restart to apply), next to its
+# sibling kanban.notify_in_gateway. When false, the text ping, the wake, the
+# cursor and the retry semantics are all untouched and a card's declared
+# artifacts stay on the card: nothing is resolved, filtered or sent.
+# ---------------------------------------------------------------------------
+
+
+class ArtifactRecordingAdapter(RecordingAdapter):
+    """Records the native-media calls the notifier makes; extract_local_files is the real one.
+
+    ``extract_local_files`` delegates to the shipped adapter rather than being
+    absent, so on the upload path the delivery policy (not an AttributeError
+    caught by the caller) decides whether a file is sent. Without it a run that
+    skipped the upload for the wrong reason would read as a pass.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.documents = []
+        self.videos = []
+        self.image_batches = []
+
+    def extract_local_files(self, content):
+        from gateway.platforms.base import BasePlatformAdapter
+        return BasePlatformAdapter.extract_local_files(content)
+
+    async def send_document(self, chat_id, file_path, metadata=None):
+        self.documents.append(file_path)
+
+    async def send_video(self, chat_id, video_path, metadata=None):
+        self.videos.append(video_path)
+
+    async def send_multiple_images(self, chat_id, images, metadata=None):
+        self.image_batches.append(images)
+
+
+def _completed_task_with_artifact(artifact_path):
+    """Complete a subscribed task declaring one real artifact on disk."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="artifact handoff", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.complete_task(
+            conn, tid, summary="handoff with one declared artifact",
+            metadata={"artifacts": [str(artifact_path)]},
+        )
+        return tid
+    finally:
+        conn.close()
+
+
+def _tick_with_kanban_config(monkeypatch, runner, kanban_config):
+    """Run one notifier tick against an explicit kanban config block."""
+    import hermes_cli.config as config_module
+
+    # The watcher imports load_config inside the coroutine, so patching the
+    # module attribute (not an imported alias) is what the tick actually reads.
+    monkeypatch.setattr(config_module, "load_config", lambda *a, **k: kanban_config)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+
+def test_notifier_uploads_artifacts_when_flag_true(tmp_path, monkeypatch):
+    """Positive control for §1.5a/§1.5c: with the key true the declared file IS uploaded.
+
+    Without this arm the flag-false test could pass for a reason that has
+    nothing to do with the switch — a path the delivery policy drops, an
+    adapter lacking the media methods, or a payload that never carried the
+    artifact.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "uploads-on.db"))
+    kb.init_db()
+    artifact = tmp_path / "evidence-on.txt"
+    artifact.write_text("evidence\n")
+    _completed_task_with_artifact(artifact)
+
+    adapter = ArtifactRecordingAdapter()
+    runner = _make_runner(adapter)
+    _tick_with_kanban_config(monkeypatch, runner, {"kanban": {"notify_artifact_uploads": True}})
+
+    assert len(adapter.sent) == 1, "the text ping is sent once"
+    assert len(adapter.documents) == 1, (
+        f"expected the declared artifact to upload, got {adapter.documents!r}"
+    )
+    assert adapter.documents[0].endswith("evidence-on.txt")
+    assert adapter.videos == []
+    assert adapter.image_batches == []
+
+
+def test_notifier_skips_artifact_uploads_when_flag_false(tmp_path, monkeypatch):
+    """§1.5a: flag false → no media call, the text ping lands once, the cursor advances."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "uploads-off.db"))
+    kb.init_db()
+    artifact = tmp_path / "evidence-off.txt"
+    artifact.write_text("evidence\n")
+    tid = _completed_task_with_artifact(artifact)
+
+    adapter = ArtifactRecordingAdapter()
+    runner = _make_runner(adapter)
+    _tick_with_kanban_config(monkeypatch, runner, {"kanban": {"notify_artifact_uploads": False}})
+
+    assert len(adapter.sent) == 1, "the text ping is untouched by the switch"
+    assert adapter.documents == [], f"send_document was called: {adapter.documents!r}"
+    assert adapter.videos == [], f"send_video was called: {adapter.videos!r}"
+    assert adapter.image_batches == [], f"send_multiple_images was called: {adapter.image_batches!r}"
+    assert _unseen_terminal_events_for(tid, "chat-1") == [], "the cursor advanced past the event"

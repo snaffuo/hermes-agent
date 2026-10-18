@@ -80,6 +80,15 @@ class GatewayKanbanWatchersMixin:
             logger.info("kanban notifier: disabled via config kanban.notify_in_gateway=false")
             return
 
+        # Artifact uploads are opt-out (SPEC-R-20261018-B). Read once here, next to
+        # the sibling above, so a change takes effect on restart — the same
+        # contract. Everything else about the notification is untouched: the text
+        # ping, the wake, the cursor and the retry semantics all still run, and the
+        # declared files stay on the card for the dashboard/reviewer to fetch.
+        self._kanban_notify_artifact_uploads = bool(kanban_cfg.get("notify_artifact_uploads", True))
+        if not self._kanban_notify_artifact_uploads:
+            logger.info("kanban notifier: artifact uploads are off (kanban.notify_artifact_uploads=false)")
+
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -156,7 +165,28 @@ class GatewayKanbanWatchersMixin:
         ``event_payload['summary']``, then ``task.result`` (legacy). Paths are
         deduplicated, missing files are skipped (may be mentioned for
         reference only), and upload errors are logged, never raised.
+
+        Disabled outright by ``kanban.notify_artifact_uploads=false`` (read once
+        at notifier start onto ``self._kanban_notify_artifact_uploads``): the
+        method returns before any path work, so nothing is resolved, filtered or
+        sent and the files stay on the card.
         """
+        if not getattr(self, "_kanban_notify_artifact_uploads", True):
+            # Off: return BEFORE any path work — no expanduser, no isfile, no
+            # delivery-policy filter, no adapter call. The count is the declared
+            # artifact list for this event, the only figure available without
+            # touching the filesystem.
+            declared = 0
+            if isinstance(event_payload, dict):
+                raw = event_payload.get("artifacts")
+                if isinstance(raw, (list, tuple)):
+                    declared = sum(1 for item in raw if isinstance(item, str) and item.strip())
+            logger.debug(
+                "kanban notifier: artifact uploads off; skipped %d declared artifact path(s) for %s",
+                declared, getattr(task, "id", None) or "unknown",
+            )
+            return
+
         raw_paths: list[str] = []
         prose_paths: list[str] = []
         if isinstance(event_payload, dict):
