@@ -1250,6 +1250,8 @@ Coverage window: desktop notifications ride the live event stream, so they fire 
 
 When you run `/kanban create …` from the gateway (Telegram, Discord, Slack, etc.), the originating chat is automatically subscribed to the new task. The gateway's background notifier polls `task_events` every few seconds and delivers one message per terminal event (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`) to that chat. Completed tasks also send the first line of the worker's `--result` so you see the outcome without having to `/kanban show`.
 
+**Artifact uploads.** When a `completed` or `review_requested` event carries declared files — `kanban_complete(artifacts=[...])` or `kanban_request_review(artifacts=[...])`, or a local path written in the handoff summary — the notifier uploads each of those files that still exists to the subscribed chat as a native attachment alongside the text ping: images embed inline, videos and everything else arrive as files. Paths are deduplicated (a staged copy and the scratch original it came from are one deliverable, so the file uploads once), a path that no longer exists is skipped rather than fatal, and a failed upload is logged, never raised — the notification itself still succeeds. Set `kanban.notify_artifact_uploads: false` to keep the text ping and the wake while leaving the files on the card for the dashboard or a reviewer to fetch; the flag is read once when the notifier starts, so restart the gateway to apply it.
+
 You can manage subscriptions explicitly from the CLI — useful when a script / cron job wants to notify a chat it didn't originate from:
 
 ```bash
